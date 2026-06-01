@@ -1,25 +1,87 @@
-# CODING AGENTS: READ THIS FIRST
+# Artifact
 
-This is a **handoff bundle** from Claude Design (claude.ai/design).
+A tiny self-hosted file sharing app for HTML prototypes. Upload `.html` files, organise them into folders, and share a clean public link — no accounts, no analytics, no third parties.
 
-A user mocked up designs in HTML/CSS/JS using an AI design tool, then exported this bundle so a coding agent can implement the designs for real.
+Built as a lightweight alternative to dropping prototypes into Vercel/Netlify when all you want is a stable URL to send someone.
 
-## What you should do — IMPORTANT
+## How it works
 
-**Read the chat transcripts first.** There are 1 chat transcript(s) in `chats/`. The transcripts show the full back-and-forth between the user and the design assistant — they tell you **what the user actually wants** and **where they landed** after iterating. Don't skip them. The final HTML files are the output, but the chat is where the intent lives.
+- **Admin side** (password-gated): browse, upload, rename, move, and delete HTML files in a folder tree. Three view modes — gallery, explorer, minimal.
+- **Public side** (no auth): anyone with a link to `/v/<path>/<file>.html` can view the file. Folder listings and the admin UI stay private.
 
-**Find the primary design file under `project/` and read it top to bottom.** The chat transcripts will tell you which file the user was last iterating on. Then **follow its imports**: open every file it pulls in (shared components, CSS, scripts) so you understand how the pieces fit together before you start implementing.
+## Stack
 
-**If anything is ambiguous, ask the user to confirm before you start implementing.** It's much cheaper to clarify scope up front than to build the wrong thing.
+- **Backend** — FastAPI (Python 3.12), session cookies in-memory, files on disk
+- **Frontend** — React + TypeScript + Vite
+- **Deploy** — single Docker image, multi-stage build
 
-## About the design files
+## Run it
 
-The design medium is **HTML/CSS/JS** — these are prototypes, not production code. Your job is to **recreate them pixel-perfectly** in whatever technology makes sense for the target codebase (React, Vue, native, whatever fits). Match the visual output; don't copy the prototype's internal structure unless it happens to fit.
+### Docker (recommended)
 
-**Don't render these files in a browser or take screenshots unless the user asks you to.** Everything you need — dimensions, colors, layout rules — is spelled out in the source. Read the HTML and CSS directly; a screenshot won't tell you anything they don't.
+```bash
+ARTIFACT_PASSWORD=your-password docker compose up --build
+```
 
-## Bundle contents
+App is at `http://localhost:3000`. Uploads persist to `./data`.
 
-- `README.md` — this file
-- `chats/` — conversation transcripts (read these!)
-- `project/` — the `Artifact` project files (HTML prototypes, assets, components)
+### Local dev
+
+Backend:
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+```
+
+Frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ARTIFACT_PASSWORD` | `artifact` | Admin login password |
+| `ARTIFACT_UPLOAD_DIR` | `backend/uploads` | Where uploaded files live |
+| `ARTIFACT_FRONTEND_DIR` | `frontend/dist` | Built frontend assets to serve |
+
+Uploads are capped at 10MB per file and restricted to `.html`.
+
+## API
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/api/auth/login` | — | Exchange password for a session cookie |
+| `POST` | `/api/auth/logout` | — | Clear session |
+| `GET` | `/api/auth/status` | — | Check session |
+| `GET` | `/api/files?path=/x` | — | List folder contents |
+| `GET` | `/api/tree` | — | Full folder tree |
+| `POST` | `/api/files/upload` | ✓ | Upload `.html` files |
+| `POST` | `/api/folders` | ✓ | Create folder |
+| `POST` | `/api/files/rename` | ✓ | Rename file or folder |
+| `POST` | `/api/files/move` | ✓ | Move file or folder |
+| `DELETE` | `/api/files` | ✓ | Delete file or folder |
+| `GET` | `/v/<path>` | — | Public render of an HTML file |
+
+## Layout
+
+```
+backend/        FastAPI app (single file)
+frontend/       React + Vite UI
+project/        Original HTML/JSX design prototypes (kept for reference)
+chats/          Design handoff transcripts
+Dockerfile      Multi-stage build
+docker-compose.yml
+```
+
+## Notes
+
+- Session tokens are in-memory — restarting the server logs everyone out.
+- CORS is open (`*`) for dev convenience; tighten it before exposing publicly.
+- Path traversal is blocked at the API layer (`resolve_path`).
