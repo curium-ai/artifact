@@ -1,0 +1,12 @@
+services:
+  artifact:
+    build: .
+    ports:
+      - "3000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      - ARTIFACT_PASSWORD=${ARTIFACT_PASSWORD:-artifact}
+      - ARTIFACT_UPLOAD_DIR=/data
+      - ARTIFACT_FRONTEND_DIR=/app/frontend/dist
+    restart: unless-stopped
