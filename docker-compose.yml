@@ -9,4 +9,7 @@ services:
       - ARTIFACT_PASSWORD=${ARTIFACT_PASSWORD:-artifact}
       - ARTIFACT_UPLOAD_DIR=/data
       - ARTIFACT_FRONTEND_DIR=/app/frontend/dist
+      - ARTIFACT_AUTH_MODE=${ARTIFACT_AUTH_MODE:-password}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - ARTIFACT_ALLOWED_DOMAIN=${ARTIFACT_ALLOWED_DOMAIN:-}
     restart: unless-stopped

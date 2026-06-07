@@ -1,4 +1,4 @@
-import type { DirectoryListing, TreeNode } from './types';
+import type { DirectoryListing, TreeNode, AuthStatus } from './types';
 
 const BASE = '';
 
@@ -23,14 +23,26 @@ export async function login(password: string): Promise<boolean> {
   return res.ok;
 }
 
+export async function googleLogin(credential: string): Promise<{ ok: boolean; email?: string }> {
+  const res = await fetch(`${BASE}/api/auth/google`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ credential }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || 'Google login failed');
+  }
+  return res.json();
+}
+
 export async function logout(): Promise<void> {
   await fetch(`${BASE}/api/auth/logout`, { method: 'POST' });
 }
 
-export async function checkAuth(): Promise<boolean> {
+export async function checkAuth(): Promise<AuthStatus> {
   const res = await fetch(`${BASE}/api/auth/status`);
-  const data = await res.json();
-  return data.authenticated;
+  return res.json();
 }
 
 export async function uploadFiles(path: string, files: File[]): Promise<{ uploaded: string[]; count: number }> {

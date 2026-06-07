@@ -15,3 +15,11 @@ export interface TreeNode {
   path: string;
   children: TreeNode[];
 }
+
+export interface AuthStatus {
+  authenticated: boolean;
+  authMode: 'password' | 'google';
+  googleClientId?: string;
+  allowedDomain?: string;
+  email?: string;
+}

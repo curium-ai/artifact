@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { FileItem, TreeNode } from './types';
+import type { FileItem, TreeNode, AuthStatus } from './types';
 import * as api from './api';
 import { ToastProvider, useToast } from './components/ui';
 import { LockIcon, UnlockIcon, SettingsIcon } from './components/Icons';
@@ -10,6 +10,7 @@ import { PasswordModal } from './components/PasswordModal';
 import { UploadModal } from './components/UploadModal';
 import { NewFolderModal } from './components/NewFolderModal';
 import { DeleteModal } from './components/DeleteModal';
+import { GoogleLoginPage } from './components/GoogleLoginPage';
 
 const STORAGE_KEY = 'artifact-settings';
 
@@ -34,6 +35,11 @@ function AppInner() {
   const [currentPath, setCurrentPath] = useState('/');
   const [viewingFile, setViewingFile] = useState<FileItem | null>(null);
   const [isAuth, setIsAuth] = useState(false);
+  const [authMode, setAuthMode] = useState<'password' | 'google'>('password');
+  const [googleClientId, setGoogleClientId] = useState('');
+  const [allowedDomain, setAllowedDomain] = useState('');
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
@@ -60,23 +66,38 @@ function AppInner() {
 
   // Check auth on mount
   useEffect(() => {
-    api.checkAuth().then(setIsAuth).catch(() => {});
+    api.checkAuth().then((status: AuthStatus) => {
+      setIsAuth(status.authenticated);
+      setAuthMode(status.authMode);
+      if (status.googleClientId) setGoogleClientId(status.googleClientId);
+      if (status.allowedDomain) setAllowedDomain(status.allowedDomain);
+      if (status.email) setUserEmail(status.email);
+      setAuthLoading(false);
+    }).catch(() => {
+      setAuthLoading(false);
+    });
   }, []);
 
   // Fetch files when path changes
   const refreshFiles = useCallback(async () => {
-    const [listing, treeData] = await Promise.all([
-      api.listFiles(currentPath),
-      api.getTree(),
-    ]);
-    setFolders(listing.folders);
-    setFiles(listing.files);
-    setTree(treeData.tree);
+    try {
+      const [listing, treeData] = await Promise.all([
+        api.listFiles(currentPath),
+        api.getTree(),
+      ]);
+      setFolders(listing.folders);
+      setFiles(listing.files);
+      setTree(treeData.tree);
+    } catch {
+      // In google mode, 401 on file listing means not authenticated
+    }
   }, [currentPath]);
 
   useEffect(() => {
+    if (authLoading) return;
+    if (authMode === 'google' && !isAuth) return;
     refreshFiles();
-  }, [refreshFiles]);
+  }, [refreshFiles, authLoading, authMode, isAuth]);
 
   const requireAuth = (callback: () => void) => {
     if (isAuth) { callback(); return; }
@@ -202,7 +223,26 @@ function AppInner() {
   const handleLogout = async () => {
     await api.logout();
     setIsAuth(false);
+    setUserEmail(null);
   };
+
+  if (authLoading) {
+    return null;
+  }
+
+  if (authMode === 'google' && !isAuth) {
+    return (
+      <GoogleLoginPage
+        clientId={googleClientId}
+        allowedDomain={allowedDomain}
+        onSuccess={(email) => {
+          setIsAuth(true);
+          setUserEmail(email);
+          refreshFiles();
+        }}
+      />
+    );
+  }
 
   if (viewingFile) {
     return <FileViewer fileName={viewingFile.name} path={currentPath} onBack={() => setViewingFile(null)} />;
@@ -222,13 +262,20 @@ function AppInner() {
           </div>
         </div>
         <div className="app-header__right">
-          <button
-            className={`auth-badge ${isAuth ? 'auth-badge--unlocked' : ''}`}
-            onClick={() => isAuth ? handleLogout() : setShowPassword(true)}
-          >
-            {isAuth ? <UnlockIcon width={14} height={14} /> : <LockIcon width={14} height={14} />}
-            <span>{isAuth ? 'Unlocked' : 'Locked'}</span>
-          </button>
+          {authMode === 'google' ? (
+            <button className="auth-badge auth-badge--unlocked" onClick={handleLogout}>
+              <UnlockIcon width={14} height={14} />
+              <span>{userEmail || 'Signed in'}</span>
+            </button>
+          ) : (
+            <button
+              className={`auth-badge ${isAuth ? 'auth-badge--unlocked' : ''}`}
+              onClick={() => isAuth ? handleLogout() : setShowPassword(true)}
+            >
+              {isAuth ? <UnlockIcon width={14} height={14} /> : <LockIcon width={14} height={14} />}
+              <span>{isAuth ? 'Unlocked' : 'Locked'}</span>
+            </button>
+          )}
 
           <div className="settings-trigger-wrap">
             <button

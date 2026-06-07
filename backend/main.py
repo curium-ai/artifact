@@ -17,7 +17,11 @@ PASSWORD = os.environ.get("ARTIFACT_PASSWORD", "artifact")
 MAX_FILE_SIZE = 10 * 1024 * 1024
 FRONTEND_DIR = Path(os.environ.get("ARTIFACT_FRONTEND_DIR", os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")))
 
-active_sessions: dict[str, float] = {}
+AUTH_MODE = os.environ.get("ARTIFACT_AUTH_MODE", "password")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+ALLOWED_DOMAIN = os.environ.get("ARTIFACT_ALLOWED_DOMAIN", "")
+
+active_sessions: dict[str, dict] = {}
 SESSION_TTL = 86400
 
 app.add_middleware(
@@ -40,11 +44,18 @@ def resolve_path(user_path: str) -> Path:
 def is_authenticated(session_token: Optional[str]) -> bool:
     if not session_token:
         return False
-    expiry = active_sessions.get(session_token)
-    if not expiry or time.time() > expiry:
+    session = active_sessions.get(session_token)
+    if not session or time.time() > session["expiry"]:
         active_sessions.pop(session_token, None)
         return False
     return True
+
+
+def get_session_email(session_token: Optional[str]) -> Optional[str]:
+    if not session_token:
+        return None
+    session = active_sessions.get(session_token)
+    return session.get("email") if session else None
 
 
 def require_auth(session_token: Optional[str]):
@@ -52,19 +63,31 @@ def require_auth(session_token: Optional[str]):
         raise HTTPException(status_code=401, detail="Authentication required")
 
 
+def require_auth_if_google(session_token: Optional[str]):
+    if AUTH_MODE == "google":
+        require_auth(session_token)
+
+
 @app.on_event("startup")
 def startup():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    if AUTH_MODE == "google":
+        if not GOOGLE_CLIENT_ID:
+            raise RuntimeError("GOOGLE_CLIENT_ID is required when ARTIFACT_AUTH_MODE=google")
+        if not ALLOWED_DOMAIN:
+            raise RuntimeError("ARTIFACT_ALLOWED_DOMAIN is required when ARTIFACT_AUTH_MODE=google")
 
 
 @app.post("/api/auth/login")
 async def login(request: Request, response: Response):
+    if AUTH_MODE == "google":
+        raise HTTPException(status_code=404, detail="Password login is disabled")
     body = await request.json()
     password = body.get("password", "")
     if password != PASSWORD:
         raise HTTPException(status_code=401, detail="Incorrect password")
     token = secrets.token_urlsafe(32)
-    active_sessions[token] = time.time() + SESSION_TTL
+    active_sessions[token] = {"expiry": time.time() + SESSION_TTL, "email": None}
     response.set_cookie(
         key="artifact_session",
         value=token,
@@ -73,6 +96,49 @@ async def login(request: Request, response: Response):
         max_age=SESSION_TTL,
     )
     return {"ok": True}
+
+
+@app.post("/api/auth/google")
+async def google_login(request: Request, response: Response):
+    if AUTH_MODE != "google":
+        raise HTTPException(status_code=404, detail="Google auth is not enabled")
+
+    body = await request.json()
+    credential = body.get("credential", "")
+    if not credential:
+        raise HTTPException(status_code=400, detail="Missing credential")
+
+    from google.oauth2 import id_token
+    from google.auth.transport import requests as google_requests
+
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            credential, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    email = idinfo.get("email", "")
+    if not email:
+        raise HTTPException(status_code=401, detail="No email in token")
+
+    domain = email.split("@")[-1].lower()
+    if domain != ALLOWED_DOMAIN.lower():
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only @{ALLOWED_DOMAIN} accounts are allowed",
+        )
+
+    token = secrets.token_urlsafe(32)
+    active_sessions[token] = {"expiry": time.time() + SESSION_TTL, "email": email}
+    response.set_cookie(
+        key="artifact_session",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=SESSION_TTL,
+    )
+    return {"ok": True, "email": email}
 
 
 @app.post("/api/auth/logout")
@@ -85,7 +151,17 @@ def logout(response: Response, artifact_session: Optional[str] = Cookie(None)):
 
 @app.get("/api/auth/status")
 def auth_status(artifact_session: Optional[str] = Cookie(None)):
-    return {"authenticated": is_authenticated(artifact_session)}
+    authenticated = is_authenticated(artifact_session)
+    result: dict = {
+        "authenticated": authenticated,
+        "authMode": AUTH_MODE,
+    }
+    if AUTH_MODE == "google":
+        result["googleClientId"] = GOOGLE_CLIENT_ID
+        result["allowedDomain"] = ALLOWED_DOMAIN
+    if authenticated:
+        result["email"] = get_session_email(artifact_session)
+    return result
 
 
 def format_time_ago(mtime: float) -> str:
@@ -117,7 +193,8 @@ def format_size(size_bytes: int) -> str:
 
 
 @app.get("/api/files")
-def list_files(path: str = "/"):
+def list_files(path: str = "/", artifact_session: Optional[str] = Cookie(None)):
+    require_auth_if_google(artifact_session)
     resolved = resolve_path(path)
     if not resolved.exists():
         return {"folders": [], "files": []}
@@ -144,7 +221,8 @@ def list_files(path: str = "/"):
 
 
 @app.get("/api/tree")
-def get_tree():
+def get_tree(artifact_session: Optional[str] = Cookie(None)):
+    require_auth_if_google(artifact_session)
     def walk(dir_path: Path, rel: str) -> list:
         result = []
         if not dir_path.exists():
@@ -279,7 +357,10 @@ async def delete_item(
 
 
 @app.get("/v/{file_path:path}")
-def serve_public(file_path: str):
+def serve_public(file_path: str, artifact_session: Optional[str] = Cookie(None)):
+    if AUTH_MODE == "google" and not is_authenticated(artifact_session):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/")
     resolved = resolve_path(file_path)
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="File not found")

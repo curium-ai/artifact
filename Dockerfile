@@ -19,6 +19,7 @@ COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 ENV ARTIFACT_UPLOAD_DIR=/data
 ENV ARTIFACT_FRONTEND_DIR=/app/frontend/dist
 ENV ARTIFACT_PASSWORD=artifact
+ENV ARTIFACT_AUTH_MODE=password
 
 EXPOSE 8000
 
