@@ -178,15 +178,36 @@ interface ContextMenuProps {
 
 export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ left: x, top: y });
+
   useEffect(() => {
-    const handler = () => onClose();
-    window.addEventListener('click', handler);
-    window.addEventListener('contextmenu', handler);
-    return () => { window.removeEventListener('click', handler); window.removeEventListener('contextmenu', handler); };
+    const handleClickOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        onClose();
+      }
+    };
+    // Use mousedown so it fires before contextmenu — avoids the race
+    // where the window listener closes a menu that onContextMenu just opened.
+    window.addEventListener('mousedown', handleClickOutside);
+    return () => { window.removeEventListener('mousedown', handleClickOutside); };
   }, [onClose]);
 
+  useEffect(() => {
+    if (!ref.current) return;
+    const rect = ref.current.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let left = x;
+    let top = y;
+    if (x + rect.width > vw) left = x - rect.width;
+    if (y + rect.height > vh) top = y - rect.height;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    setPos({ left, top });
+  }, [x, y]);
+
   return (
-    <div className="context-menu" ref={ref} style={{ left: x, top: y }}>
+    <div className="context-menu" ref={ref} style={{ left: pos.left, top: pos.top }}>
       {items.map((item, i) =>
         item.divider ? <div key={i} className="context-menu__divider"></div> :
         <button key={i} className={`context-menu__item ${item.danger ? 'context-menu__item--danger' : ''}`} onClick={() => { item.action?.(); onClose(); }}>

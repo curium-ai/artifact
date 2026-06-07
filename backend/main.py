@@ -4,6 +4,9 @@ import secrets
 import time
 from pathlib import Path, PurePosixPath
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Cookie, Response, Request, Query
 from fastapi.responses import HTMLResponse
