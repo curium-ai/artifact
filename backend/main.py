@@ -1,7 +1,9 @@
+import asyncio
 import os
 import shutil
 import secrets
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import Optional
 from dotenv import load_dotenv
@@ -71,14 +73,33 @@ def require_auth_if_google(session_token: Optional[str]):
         require_auth(session_token)
 
 
-@app.on_event("startup")
-def startup():
+# Mount MCP server at /mcp
+_mcp_app = None
+try:
+    from mcp_server import create_mcp_app
+    _mcp_app = create_mcp_app()
+    app.mount("/mcp", _mcp_app)
+except Exception as e:
+    import sys
+    print(f"Warning: MCP server not mounted: {e}", file=sys.stderr)
+
+
+@asynccontextmanager
+async def _lifespan(_app):
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     if AUTH_MODE == "google":
         if not GOOGLE_CLIENT_ID:
             raise RuntimeError("GOOGLE_CLIENT_ID is required when ARTIFACT_AUTH_MODE=google")
         if not ALLOWED_DOMAIN:
             raise RuntimeError("ARTIFACT_ALLOWED_DOMAIN is required when ARTIFACT_AUTH_MODE=google")
+
+    if _mcp_app and hasattr(_mcp_app, "lifespan"):
+        async with _mcp_app.lifespan(_app):
+            yield
+    else:
+        yield
+
+app.router.lifespan_context = _lifespan
 
 
 @app.post("/api/auth/login")
