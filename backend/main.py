@@ -1,4 +1,3 @@
-import asyncio
 import os
 import shutil
 import secrets
@@ -76,8 +75,25 @@ def require_auth_if_google(session_token: Optional[str]):
 # Mount MCP server at /mcp
 _mcp_app = None
 try:
+    from starlette.routing import Route as _StarletteRoute
     from mcp_server import create_mcp_app
     _mcp_app = create_mcp_app()
+
+    # RFC 8414/9728: well-known discovery endpoints must be reachable at the
+    # origin level (/.well-known/...), not behind the /mcp mount prefix.
+    # Extract them from the MCP app and register on the main app.
+    for _route in list(_mcp_app.routes):
+        if isinstance(_route, _StarletteRoute) and _route.path.startswith("/.well-known/"):
+            app.routes.insert(0, _route)
+            # Add RFC 8414 path-aware variant so clients that compute
+            # /.well-known/oauth-authorization-server/mcp also find it
+            if not _route.path.rstrip("/").endswith("/mcp"):
+                app.routes.insert(0, _StarletteRoute(
+                    _route.path.rstrip("/") + "/mcp",
+                    endpoint=_route.endpoint,
+                    methods=_route.methods,
+                ))
+
     app.mount("/mcp", _mcp_app)
 except Exception as e:
     import sys
