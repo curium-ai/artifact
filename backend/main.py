@@ -2,6 +2,7 @@ import os
 import shutil
 import secrets
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import Optional
 from dotenv import load_dotenv
@@ -71,14 +72,71 @@ def require_auth_if_google(session_token: Optional[str]):
         require_auth(session_token)
 
 
-@app.on_event("startup")
-def startup():
+# Mount MCP server at /mcp
+_mcp_app = None
+try:
+    from starlette.routing import Route as _StarletteRoute
+    from mcp_server import create_mcp_app
+    _mcp_app = create_mcp_app()
+
+    # RFC 8414/9728: well-known discovery endpoints must be reachable at the
+    # origin level (/.well-known/...), not behind the /mcp mount prefix.
+    # Extract them from the MCP app and register on the main app.
+    for _route in list(_mcp_app.routes):
+        if isinstance(_route, _StarletteRoute) and _route.path.startswith("/.well-known/"):
+            app.routes.insert(0, _route)
+            # Add RFC 8414 path-aware variant so clients that compute
+            # /.well-known/oauth-authorization-server/mcp also find it
+            if not _route.path.rstrip("/").endswith("/mcp"):
+                app.routes.insert(0, _StarletteRoute(
+                    _route.path.rstrip("/") + "/mcp",
+                    endpoint=_route.endpoint,
+                    methods=_route.methods,
+                ))
+
+    app.mount("/mcp", _mcp_app)
+
+    # Starlette mounts only match the prefix WITH a trailing slash (/mcp/),
+    # so a bare POST /mcp falls through to the frontend SPA catch-all and
+    # returns 405. MCP clients (e.g. claude.ai) connect to the URL exactly as
+    # configured (".../mcp", no slash) and POST JSON-RPC there. This pure-ASGI
+    # middleware rewrites the bare "/mcp" path to "/mcp/" before routing, so it
+    # reaches the mounted MCP app. Pure ASGI (not BaseHTTPMiddleware) so it does
+    # not buffer the streamable-http SSE response.
+    class _MCPTrailingSlash:
+        def __init__(self, asgi_app):
+            self.asgi_app = asgi_app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http" and scope.get("path") == "/mcp":
+                scope = dict(scope)
+                scope["path"] = "/mcp/"
+                if scope.get("raw_path"):
+                    scope["raw_path"] = b"/mcp/"
+            await self.asgi_app(scope, receive, send)
+
+    app.add_middleware(_MCPTrailingSlash)
+except Exception as e:
+    import sys
+    print(f"Warning: MCP server not mounted: {e}", file=sys.stderr)
+
+
+@asynccontextmanager
+async def _lifespan(_app):
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     if AUTH_MODE == "google":
         if not GOOGLE_CLIENT_ID:
             raise RuntimeError("GOOGLE_CLIENT_ID is required when ARTIFACT_AUTH_MODE=google")
         if not ALLOWED_DOMAIN:
             raise RuntimeError("ARTIFACT_ALLOWED_DOMAIN is required when ARTIFACT_AUTH_MODE=google")
+
+    if _mcp_app and hasattr(_mcp_app, "lifespan"):
+        async with _mcp_app.lifespan(_app):
+            yield
+    else:
+        yield
+
+app.router.lifespan_context = _lifespan
 
 
 @app.post("/api/auth/login")
