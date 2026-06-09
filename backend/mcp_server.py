@@ -83,7 +83,7 @@ async def google_callback(request: Request):
         return HTMLResponse(
             f"<h1>Access denied</h1><p>{e}</p>", status_code=403
         )
-    except (ValueError, Exception) as e:
+    except Exception as e:
         return HTMLResponse(
             f"<h1>Authentication error</h1><p>{e}</p>", status_code=400
         )
