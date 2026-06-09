@@ -95,6 +95,27 @@ try:
                 ))
 
     app.mount("/mcp", _mcp_app)
+
+    # Starlette mounts only match the prefix WITH a trailing slash (/mcp/),
+    # so a bare POST /mcp falls through to the frontend SPA catch-all and
+    # returns 405. MCP clients (e.g. claude.ai) connect to the URL exactly as
+    # configured (".../mcp", no slash) and POST JSON-RPC there. This pure-ASGI
+    # middleware rewrites the bare "/mcp" path to "/mcp/" before routing, so it
+    # reaches the mounted MCP app. Pure ASGI (not BaseHTTPMiddleware) so it does
+    # not buffer the streamable-http SSE response.
+    class _MCPTrailingSlash:
+        def __init__(self, asgi_app):
+            self.asgi_app = asgi_app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http" and scope.get("path") == "/mcp":
+                scope = dict(scope)
+                scope["path"] = "/mcp/"
+                if scope.get("raw_path"):
+                    scope["raw_path"] = b"/mcp/"
+            await self.asgi_app(scope, receive, send)
+
+    app.add_middleware(_MCPTrailingSlash)
 except Exception as e:
     import sys
     print(f"Warning: MCP server not mounted: {e}", file=sys.stderr)
