@@ -1,6 +1,7 @@
 import os
 import shutil
 import secrets
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
@@ -25,8 +26,67 @@ AUTH_MODE = os.environ.get("ARTIFACT_AUTH_MODE", "password")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 ALLOWED_DOMAIN = os.environ.get("ARTIFACT_ALLOWED_DOMAIN", "")
 
-active_sessions: dict[str, dict] = {}
 SESSION_TTL = 86400
+
+
+class SessionStore:
+    """SQLite-backed store for web login sessions.
+
+    Sessions must survive process restarts (Render restarts dynos freely).
+    Shares the dotfile db on the upload disk with the MCP token store so it
+    stays hidden from file listings.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        with self._connect() as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS web_sessions (
+                    token TEXT PRIMARY KEY,
+                    email TEXT,
+                    expires_at REAL NOT NULL
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db_path)
+
+    def get(self, token: str) -> Optional[dict]:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT email, expires_at FROM web_sessions WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if not row:
+                return None
+            email, expires_at = row
+            if time.time() > expires_at:
+                db.execute("DELETE FROM web_sessions WHERE token = ?", (token,))
+                return None
+        return {"email": email, "expiry": expires_at}
+
+    def save(self, token: str, email: Optional[str], expires_at: float) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO web_sessions (token, email, expires_at) VALUES (?, ?, ?)",
+                (token, email, expires_at),
+            )
+            db.execute(
+                "DELETE FROM web_sessions WHERE expires_at < ?", (time.time(),)
+            )
+
+    def delete(self, token: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM web_sessions WHERE token = ?", (token,))
+
+
+# Same dotfile db as the MCP token store (see mcp_server.py) so both hide
+# behind one dot-prefixed file on the persistent upload disk.
+SESSION_DB = os.environ.get("ARTIFACT_MCP_AUTH_DB", str(UPLOAD_DIR / ".mcp_auth.db"))
+session_store = SessionStore(SESSION_DB)
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,17 +108,13 @@ def resolve_path(user_path: str) -> Path:
 def is_authenticated(session_token: Optional[str]) -> bool:
     if not session_token:
         return False
-    session = active_sessions.get(session_token)
-    if not session or time.time() > session["expiry"]:
-        active_sessions.pop(session_token, None)
-        return False
-    return True
+    return session_store.get(session_token) is not None
 
 
 def get_session_email(session_token: Optional[str]) -> Optional[str]:
     if not session_token:
         return None
-    session = active_sessions.get(session_token)
+    session = session_store.get(session_token)
     return session.get("email") if session else None
 
 
@@ -148,7 +204,7 @@ async def login(request: Request, response: Response):
     if password != PASSWORD:
         raise HTTPException(status_code=401, detail="Incorrect password")
     token = secrets.token_urlsafe(32)
-    active_sessions[token] = {"expiry": time.time() + SESSION_TTL, "email": None}
+    session_store.save(token, None, time.time() + SESSION_TTL)
     response.set_cookie(
         key="artifact_session",
         value=token,
@@ -191,7 +247,7 @@ async def google_login(request: Request, response: Response):
         )
 
     token = secrets.token_urlsafe(32)
-    active_sessions[token] = {"expiry": time.time() + SESSION_TTL, "email": email}
+    session_store.save(token, email, time.time() + SESSION_TTL)
     response.set_cookie(
         key="artifact_session",
         value=token,
@@ -205,7 +261,7 @@ async def google_login(request: Request, response: Response):
 @app.post("/api/auth/logout")
 def logout(response: Response, artifact_session: Optional[str] = Cookie(None)):
     if artifact_session:
-        active_sessions.pop(artifact_session, None)
+        session_store.delete(artifact_session)
     response.delete_cookie("artifact_session")
     return {"ok": True}
 
