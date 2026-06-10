@@ -1,5 +1,6 @@
 import os
 import secrets
+import sqlite3
 import time
 from urllib.parse import urlencode
 
@@ -17,6 +18,114 @@ GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 SESSION_TTL = 86400  # 24 hours, matches main app
 
 
+class TokenStore:
+    """SQLite-backed store for OAuth clients and tokens.
+
+    Tokens must survive process restarts (Render restarts dynos freely),
+    so anything with a lifetime beyond a single auth flow lives here.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        with self._connect() as db:
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS mcp_clients (
+                    client_id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mcp_access_tokens (
+                    token TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    expires_at REAL
+                );
+                CREATE TABLE IF NOT EXISTS mcp_refresh_tokens (
+                    token TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    email TEXT NOT NULL
+                );
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db_path)
+
+    # -- clients --
+
+    def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT data FROM mcp_clients WHERE client_id = ?", (client_id,)
+            ).fetchone()
+        return OAuthClientInformationFull.model_validate_json(row[0]) if row else None
+
+    def save_client(self, client_info: OAuthClientInformationFull) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO mcp_clients (client_id, data) VALUES (?, ?)",
+                (client_info.client_id, client_info.model_dump_json()),
+            )
+
+    # -- access tokens --
+
+    def get_access_token(self, token: str) -> AccessToken | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT data, expires_at FROM mcp_access_tokens WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if not row:
+                return None
+            data, expires_at = row
+            if expires_at is not None and time.time() > expires_at:
+                db.execute("DELETE FROM mcp_access_tokens WHERE token = ?", (token,))
+                return None
+        return AccessToken.model_validate_json(data)
+
+    def save_access_token(self, at: AccessToken) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO mcp_access_tokens (token, data, expires_at) VALUES (?, ?, ?)",
+                (at.token, at.model_dump_json(), at.expires_at),
+            )
+            db.execute(
+                "DELETE FROM mcp_access_tokens WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (time.time(),),
+            )
+
+    def delete_access_token(self, token: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM mcp_access_tokens WHERE token = ?", (token,))
+
+    # -- refresh tokens --
+
+    def get_refresh_token(self, token: str) -> RefreshToken | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT data FROM mcp_refresh_tokens WHERE token = ?", (token,)
+            ).fetchone()
+        return RefreshToken.model_validate_json(row[0]) if row else None
+
+    def get_refresh_email(self, token: str) -> str | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT email FROM mcp_refresh_tokens WHERE token = ?", (token,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def save_refresh_token(self, rt: RefreshToken, email: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO mcp_refresh_tokens (token, data, email) VALUES (?, ?, ?)",
+                (rt.token, rt.model_dump_json(), email),
+            )
+
+    def delete_refresh_token(self, token: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM mcp_refresh_tokens WHERE token = ?", (token,))
+
+
 class ArtifactOAuthProvider(OAuthProvider):
     """MCP OAuth provider that delegates identity to Google Sign-In
     and gates access on the configured email domain."""
@@ -27,6 +136,7 @@ class ArtifactOAuthProvider(OAuthProvider):
         google_client_id: str,
         google_client_secret: str,
         allowed_domain: str,
+        db_path: str,
     ):
         super().__init__(
             base_url=base_url,
@@ -36,22 +146,21 @@ class ArtifactOAuthProvider(OAuthProvider):
         self.google_client_secret = google_client_secret
         self.allowed_domain = allowed_domain.lower()
 
-        self._clients: dict[str, OAuthClientInformationFull] = {}
+        # Long-lived state (clients, tokens) is persisted to SQLite so it
+        # survives restarts; only mid-flow state stays in memory.
+        self._store = TokenStore(db_path)
         self._pending_google: dict[str, dict] = {}
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._code_emails: dict[str, str] = {}
-        self._access_tokens: dict[str, AccessToken] = {}
-        self._refresh_tokens: dict[str, RefreshToken] = {}
-        self._refresh_emails: dict[str, str] = {}
 
     # -- client registration --------------------------------------------------
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self._clients.get(client_id)
+        return self._store.get_client(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if client_info.client_id:
-            self._clients[client_info.client_id] = client_info
+            self._store.save_client(client_info)
 
     # -- authorization ---------------------------------------------------------
 
@@ -150,21 +259,20 @@ class ArtifactOAuthProvider(OAuthProvider):
         self._auth_codes.pop(authorization_code.code, None)
 
         access_token = secrets.token_urlsafe(32)
-        self._access_tokens[access_token] = AccessToken(
+        self._store.save_access_token(AccessToken(
             token=access_token,
             client_id=client.client_id or "",
             scopes=authorization_code.scopes,
             expires_at=int(time.time()) + SESSION_TTL,
             claims={"email": email},
-        )
+        ))
 
         refresh_token = secrets.token_urlsafe(32)
-        self._refresh_tokens[refresh_token] = RefreshToken(
+        self._store.save_refresh_token(RefreshToken(
             token=refresh_token,
             client_id=client.client_id or "",
             scopes=authorization_code.scopes,
-        )
-        self._refresh_emails[refresh_token] = email
+        ), email)
 
         return OAuthToken(
             access_token=access_token,
@@ -176,16 +284,12 @@ class ArtifactOAuthProvider(OAuthProvider):
     # -- token validation & refresh --------------------------------------------
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        at = self._access_tokens.get(token)
-        if at and (at.expires_at is None or time.time() <= at.expires_at):
-            return at
-        self._access_tokens.pop(token, None)
-        return None
+        return self._store.get_access_token(token)
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        return self._refresh_tokens.get(refresh_token)
+        return self._store.get_refresh_token(refresh_token)
 
     async def exchange_refresh_token(
         self,
@@ -193,26 +297,25 @@ class ArtifactOAuthProvider(OAuthProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        email = self._refresh_emails.pop(refresh_token.token, "unknown")
-        self._refresh_tokens.pop(refresh_token.token, None)
+        email = self._store.get_refresh_email(refresh_token.token) or "unknown"
+        self._store.delete_refresh_token(refresh_token.token)
 
         new_access = secrets.token_urlsafe(32)
         effective_scopes = scopes or refresh_token.scopes
-        self._access_tokens[new_access] = AccessToken(
+        self._store.save_access_token(AccessToken(
             token=new_access,
             client_id=client.client_id or "",
             scopes=effective_scopes,
             expires_at=int(time.time()) + SESSION_TTL,
             claims={"email": email},
-        )
+        ))
 
         new_refresh = secrets.token_urlsafe(32)
-        self._refresh_tokens[new_refresh] = RefreshToken(
+        self._store.save_refresh_token(RefreshToken(
             token=new_refresh,
             client_id=client.client_id or "",
             scopes=effective_scopes,
-        )
-        self._refresh_emails[new_refresh] = email
+        ), email)
 
         return OAuthToken(
             access_token=new_access,
@@ -225,7 +328,6 @@ class ArtifactOAuthProvider(OAuthProvider):
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         if isinstance(token, AccessToken):
-            self._access_tokens.pop(token.token, None)
+            self._store.delete_access_token(token.token)
         elif isinstance(token, RefreshToken):
-            self._refresh_tokens.pop(token.token, None)
-            self._refresh_emails.pop(token.token, None)
+            self._store.delete_refresh_token(token.token)
