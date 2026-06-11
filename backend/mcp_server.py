@@ -22,6 +22,9 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 ALLOWED_DOMAIN = os.environ.get("ARTIFACT_ALLOWED_DOMAIN", "")
 MCP_BASE_URL = os.environ.get("ARTIFACT_MCP_BASE_URL", "http://localhost:8000/mcp")
+# Lives inside the upload dir by default so it lands on the persistent disk in
+# production; dotfiles are hidden from all file listings.
+MCP_AUTH_DB = os.environ.get("ARTIFACT_MCP_AUTH_DB", str(UPLOAD_DIR / ".mcp_auth.db"))
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +38,7 @@ if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and ALLOWED_DOMAIN:
         google_client_id=GOOGLE_CLIENT_ID,
         google_client_secret=GOOGLE_CLIENT_SECRET,
         allowed_domain=ALLOWED_DOMAIN,
+        db_path=MCP_AUTH_DB,
     )
 
 

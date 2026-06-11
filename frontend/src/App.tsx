@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { FileItem, TreeNode, AuthStatus } from './types';
 import * as api from './api';
+import { publicHref } from './utils';
 import { ToastProvider, useToast } from './components/ui';
 import { LockIcon, UnlockIcon, SettingsIcon } from './components/Icons';
 import { ExplorerView } from './components/ExplorerView';
@@ -139,15 +140,13 @@ function AppInner() {
         });
         break;
       case 'copy-link': {
-        const path = currentPath === '/' ? '' : currentPath;
-        const url = `${window.location.origin}/v${path}/${item.name}`;
+        const url = window.location.origin + publicHref(currentPath, item.name);
         navigator.clipboard.writeText(url).catch(() => {});
         toast('Link copied to clipboard');
         break;
       }
       case 'open-tab': {
-        const path = currentPath === '/' ? '' : currentPath;
-        window.open(`/v${path}/${item.name}`, '_blank');
+        window.open(publicHref(currentPath, item.name), '_blank');
         break;
       }
     }

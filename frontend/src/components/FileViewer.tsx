@@ -1,5 +1,6 @@
 import { ArrowLeftIcon, FileHtmlIcon, CopyIcon, ExternalLinkIcon, LinkIcon } from './Icons';
 import { Button, useToast } from './ui';
+import { publicHref } from '../utils';
 
 interface FileViewerProps {
   fileName: string;
@@ -9,7 +10,7 @@ interface FileViewerProps {
 
 export function FileViewer({ fileName, path, onBack }: FileViewerProps) {
   const toast = useToast();
-  const publicPath = `/v${path === '/' ? '' : path}/${fileName}`;
+  const publicPath = publicHref(path, fileName);
   const publicUrl = window.location.origin + publicPath;
 
   const handleCopyLink = () => {
