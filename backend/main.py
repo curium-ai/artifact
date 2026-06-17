@@ -26,7 +26,7 @@ AUTH_MODE = os.environ.get("ARTIFACT_AUTH_MODE", "password")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 ALLOWED_DOMAIN = os.environ.get("ARTIFACT_ALLOWED_DOMAIN", "")
 
-SESSION_TTL = 86400
+SESSION_TTL = 30 * 86400  # 30 days; slides forward on each visit (see auth_status)
 
 
 class SessionStore:
@@ -77,6 +77,15 @@ class SessionStore:
             db.execute(
                 "DELETE FROM web_sessions WHERE expires_at < ?", (time.time(),)
             )
+
+    def touch(self, token: str, new_expires_at: float) -> Optional[dict]:
+        """Slide a live session's expiry forward. Returns the session, or None
+        if the token is unknown/expired (so active users never get logged out)."""
+        session = self.get(token)
+        if session is None:
+            return None
+        self.save(token, session["email"], new_expires_at)
+        return session
 
     def delete(self, token: str) -> None:
         with self._connect() as db:
@@ -267,8 +276,20 @@ def logout(response: Response, artifact_session: Optional[str] = Cookie(None)):
 
 
 @app.get("/api/auth/status")
-def auth_status(artifact_session: Optional[str] = Cookie(None)):
-    authenticated = is_authenticated(artifact_session)
+def auth_status(response: Response, artifact_session: Optional[str] = Cookie(None)):
+    # Slide the session forward on every app open so active users stay logged
+    # in. The frontend calls this on mount, so opening artifact renews both the
+    # server-side row and the browser cookie for another full TTL.
+    session = session_store.touch(artifact_session, time.time() + SESSION_TTL) if artifact_session else None
+    authenticated = session is not None
+    if authenticated:
+        response.set_cookie(
+            key="artifact_session",
+            value=artifact_session,
+            httponly=True,
+            samesite="lax",
+            max_age=SESSION_TTL,
+        )
     result: dict = {
         "authenticated": authenticated,
         "authMode": AUTH_MODE,
@@ -277,7 +298,7 @@ def auth_status(artifact_session: Optional[str] = Cookie(None)):
         result["googleClientId"] = GOOGLE_CLIENT_ID
         result["allowedDomain"] = ALLOWED_DOMAIN
     if authenticated:
-        result["email"] = get_session_email(artifact_session)
+        result["email"] = session["email"]
     return result
 
 
