@@ -385,6 +385,7 @@ html, body, #root {
 .empty-state__icon { color: var(--text-tertiary); margin-bottom: 4px; }
 .empty-state__title { font-size: 14px; font-weight: 500; color: var(--text-primary); }
 .empty-state__sub { font-size: 13px; color: var(--text-tertiary); }
+.empty-state__action { margin-top: 12px; }
 
 /* ═══════════════════════════════════════
    EXPLORER VIEW
@@ -441,6 +442,17 @@ html, body, #root {
 .explorer__row:hover { background: var(--bg-fill-highlight); }
 .explorer__row--drag-over { background: var(--bg-fill-highlight); outline: 2px solid var(--accent); outline-offset: -2px; }
 .explorer__row--dragging { opacity: 0.5; }
+.explorer__row--selected, .explorer__row--selected:hover { background: var(--bg-fill-highlight); }
+.explorer__row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.explorer__row--skeleton, .explorer__row--skeleton:hover { cursor: default; background: none; }
+.skeleton {
+  display: inline-block; height: 12px; border-radius: 4px;
+  background: var(--bg-surface-secondary);
+  animation: skeleton-pulse 1.2s ease-in-out infinite;
+}
+.skeleton--name { width: 40%; min-width: 120px; }
+.skeleton--sm { width: 48px; }
+@keyframes skeleton-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 .explorer__td {
   padding: 8px 12px; font-size: 13px; border-bottom: 1px solid var(--bg-surface-secondary);
   white-space: nowrap;
@@ -485,6 +497,12 @@ html, body, #root {
 .viewer__frame iframe {
   width: 100%; height: 100%; border: none;
 }
+.viewer__missing {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; flex: 1; color: var(--text-tertiary); text-align: center; padding: 24px;
+}
+.viewer__missing-title { font-size: 15px; font-weight: 500; color: var(--text-primary); }
+.viewer__missing-sub { font-size: 13px; color: var(--text-tertiary); margin-bottom: 8px; }
 
 .viewer__url-bar {
   display: flex; align-items: center; gap: 6px;
@@ -664,3 +682,17 @@ html, body, #root {
   max-width: 280px;
   margin: 0;
 }
+
+/* ═══════════════════════════════════════
+   ERROR BOUNDARY
+   ═══════════════════════════════════════ */
+.app-error {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; padding: 24px; background: var(--bg-page);
+}
+.app-error__box {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  text-align: center; max-width: 380px;
+}
+.app-error__title { font-size: 18px; font-weight: 600; color: var(--text-primary); }
+.app-error__sub { font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; }

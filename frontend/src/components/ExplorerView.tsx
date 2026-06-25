@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef, type DragEvent } from 'react';
 import type { FileItem, TreeNode } from '../types';
+import type { DirectoryStatus } from '../hooks/useDirectory';
 import { FolderIcon, FolderOpenIcon, FileHtmlIcon, ChevronRightIcon, ChevronDownIcon, MoreIcon, LinkIcon, ExternalLinkIcon, EditIcon, TrashIcon, PlusIcon, UploadIcon } from './Icons';
 import { Button, Breadcrumb, ContextMenu, EmptyState, type ContextMenuItem } from './ui';
 
@@ -8,10 +9,12 @@ interface ExplorerViewProps {
   folders: string[];
   files: FileItem[];
   tree: TreeNode[];
+  status: DirectoryStatus;
   onNavigate: (path: string) => void;
   onOpenFile: (file: FileItem) => void;
   onAction: (action: string, item?: { name: string; type: string }) => void;
   onMove: (name: string, fromPath: string, toPath: string) => void;
+  onReload?: () => void;
 }
 
 // ─── Sidebar Tree Item ───
@@ -62,15 +65,19 @@ function SidebarTreeItem({ node, currentPath, onNavigate, depth = 0, onDrop }: {
   );
 }
 
-export function ExplorerView({ currentPath, folders, files, tree, onNavigate, onOpenFile, onAction, onMove }: ExplorerViewProps) {
+export function ExplorerView({ currentPath, folders, files, tree, status, onNavigate, onOpenFile, onAction, onMove, onReload }: ExplorerViewProps) {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
   const [sortBy, setSortBy] = useState<'name' | 'size'>('name');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
   const [draggingItem, setDraggingItem] = useState<string | null>(null);
+  const [selected, setSelected] = useState<{ name: string; type: string } | null>(null);
   const [renamingItem, setRenamingItem] = useState<{ name: string; type: string } | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const renameRef = useRef<HTMLInputElement>(null);
+
+  // Clear the row selection whenever the folder changes.
+  useEffect(() => { setSelected(null); }, [currentPath]);
 
   useEffect(() => {
     if (renamingItem && renameRef.current) {
@@ -203,13 +210,46 @@ export function ExplorerView({ currentPath, folders, files, tree, onNavigate, on
               </tr>
             </thead>
             <tbody>
-              {folders.map(folder => {
+              {status === 'loading' && Array.from({ length: 5 }).map((_, i) => (
+                <tr key={`skeleton-${i}`} className="explorer__row explorer__row--skeleton">
+                  <td className="explorer__td explorer__td--name"><span className="skeleton skeleton--name" /></td>
+                  <td className="explorer__td explorer__td--size"><span className="skeleton skeleton--sm" /></td>
+                  <td className="explorer__td explorer__td--modified"><span className="skeleton skeleton--sm" /></td>
+                  <td className="explorer__td explorer__td--actions"></td>
+                </tr>
+              ))}
+              {status === 'not-found' && (
+                <tr><td colSpan={4}>
+                  <EmptyState
+                    icon={<FolderIcon width={32} height={32} />}
+                    title="Folder not found"
+                    subtitle="This folder may have been moved or deleted."
+                    action={<Button size="small" onClick={() => onNavigate('/')}>Back to home</Button>}
+                  />
+                </td></tr>
+              )}
+              {status === 'error' && (
+                <tr><td colSpan={4}>
+                  <EmptyState
+                    icon={<FolderIcon width={32} height={32} />}
+                    title="Couldn't load this folder"
+                    subtitle="Something went wrong while loading its contents."
+                    action={<Button size="small" onClick={() => onReload?.()}>Retry</Button>}
+                  />
+                </td></tr>
+              )}
+              {status === 'ready' && folders.map(folder => {
                 const folderPath = currentPath === '/' ? `/${folder}` : `${currentPath}/${folder}`;
                 const isRenaming = renamingItem?.name === folder && renamingItem?.type === 'folder';
                 return (
                   <tr key={folder}
-                    className={`explorer__row explorer__row--folder ${dragOverFolder === folder ? 'explorer__row--drag-over' : ''} ${draggingItem === folder ? 'explorer__row--dragging' : ''}`}
-                    onClick={() => !isRenaming && onNavigate(folderPath)}
+                    className={`explorer__row explorer__row--folder ${selected?.name === folder && selected?.type === 'folder' ? 'explorer__row--selected' : ''} ${dragOverFolder === folder ? 'explorer__row--drag-over' : ''} ${draggingItem === folder ? 'explorer__row--dragging' : ''}`}
+                    role="button"
+                    tabIndex={isRenaming ? -1 : 0}
+                    aria-label={`Folder ${folder}`}
+                    onClick={() => !isRenaming && setSelected({ name: folder, type: 'folder' })}
+                    onDoubleClick={() => !isRenaming && onNavigate(folderPath)}
+                    onKeyDown={e => { if (!isRenaming && e.key === 'Enter') onNavigate(folderPath); }}
                     onContextMenu={e => handleContextMenu(e, { name: folder, type: 'folder' })}
                     draggable={!isRenaming}
                     onDragStart={e => handleDragStart(e, folder, 'folder')}
@@ -244,12 +284,17 @@ export function ExplorerView({ currentPath, folders, files, tree, onNavigate, on
                   </tr>
                 );
               })}
-              {sortedFiles.map(file => {
+              {status === 'ready' && sortedFiles.map(file => {
                 const isRenaming = renamingItem?.name === file.name && renamingItem?.type === 'file';
                 return (
                   <tr key={file.name}
-                    className={`explorer__row explorer__row--file ${draggingItem === file.name ? 'explorer__row--dragging' : ''}`}
+                    className={`explorer__row explorer__row--file ${selected?.name === file.name && selected?.type === 'file' ? 'explorer__row--selected' : ''} ${draggingItem === file.name ? 'explorer__row--dragging' : ''}`}
+                    role="button"
+                    tabIndex={isRenaming ? -1 : 0}
+                    aria-label={`File ${file.name}`}
+                    onClick={() => !isRenaming && setSelected({ name: file.name, type: 'file' })}
                     onDoubleClick={() => !isRenaming && onOpenFile(file)}
+                    onKeyDown={e => { if (!isRenaming && e.key === 'Enter') onOpenFile(file); }}
                     onContextMenu={e => handleContextMenu(e, { name: file.name, type: 'file' })}
                     draggable={!isRenaming}
                     onDragStart={e => handleDragStart(e, file.name, 'file')}
@@ -281,7 +326,7 @@ export function ExplorerView({ currentPath, folders, files, tree, onNavigate, on
                   </tr>
                 );
               })}
-              {folders.length === 0 && files.length === 0 && (
+              {status === 'ready' && folders.length === 0 && files.length === 0 && (
                 <tr><td colSpan={4}>
                   <EmptyState
                     icon={<FolderIcon width={32} height={32} />}

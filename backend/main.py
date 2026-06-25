@@ -335,7 +335,7 @@ def list_files(path: str = "/", artifact_session: Optional[str] = Cookie(None)):
     require_auth_if_google(artifact_session)
     resolved = resolve_path(path)
     if not resolved.exists():
-        return {"folders": [], "files": []}
+        raise HTTPException(status_code=404, detail="Folder not found")
     if not resolved.is_dir():
         raise HTTPException(status_code=400, detail="Not a directory")
 

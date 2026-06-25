@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
-import type { FileItem, TreeNode, AuthStatus } from './types';
+import { useState, useEffect } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import type { FileItem, AuthStatus } from './types';
 import * as api from './api';
-import { publicHref } from './utils';
+import { publicHref, folderUrl, fileUrl, parseLocation } from './utils';
+import { useDirectory } from './hooks/useDirectory';
 import { ToastProvider, useToast } from './components/ui';
 import { LockIcon, UnlockIcon, SettingsIcon } from './components/Icons';
 import { ExplorerView } from './components/ExplorerView';
@@ -33,8 +35,11 @@ function AppInner() {
   const [accentColor, setAccentColor] = useState(saved.accentColor);
   const [showSettings, setShowSettings] = useState(false);
 
-  const [currentPath, setCurrentPath] = useState('/');
-  const [viewingFile, setViewingFile] = useState<FileItem | null>(null);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const view = parseLocation(location.pathname);
+  const currentPath = view.path;
+
   const [isAuth, setIsAuth] = useState(false);
   const [authMode, setAuthMode] = useState<'password' | 'google'>('password');
   const [googleClientId, setGoogleClientId] = useState('');
@@ -47,9 +52,11 @@ function AppInner() {
   const [showDelete, setShowDelete] = useState<{ name: string; type: string } | null>(null);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
 
-  const [folders, setFolders] = useState<string[]>([]);
-  const [files, setFiles] = useState<FileItem[]>([]);
-  const [tree, setTree] = useState<TreeNode[]>([]);
+  // Directory contents are owned by a race-proof hook keyed on the URL path.
+  // Only load while we're on a folder view and (in google mode) authenticated.
+  const dirEnabled = !authLoading && !(authMode === 'google' && !isAuth) && view.mode === 'folder';
+  const dir = useDirectory(currentPath, dirEnabled);
+  const refreshFiles = dir.reload;
 
   const toast = useToast();
 
@@ -78,27 +85,6 @@ function AppInner() {
       setAuthLoading(false);
     });
   }, []);
-
-  // Fetch files when path changes
-  const refreshFiles = useCallback(async () => {
-    try {
-      const [listing, treeData] = await Promise.all([
-        api.listFiles(currentPath),
-        api.getTree(),
-      ]);
-      setFolders(listing.folders);
-      setFiles(listing.files);
-      setTree(treeData.tree);
-    } catch {
-      // In google mode, 401 on file listing means not authenticated
-    }
-  }, [currentPath]);
-
-  useEffect(() => {
-    if (authLoading) return;
-    if (authMode === 'google' && !isAuth) return;
-    refreshFiles();
-  }, [refreshFiles, authLoading, authMode, isAuth]);
 
   const requireAuth = (callback: () => void) => {
     if (isAuth) { callback(); return; }
@@ -243,8 +229,8 @@ function AppInner() {
     );
   }
 
-  if (viewingFile) {
-    return <FileViewer fileName={viewingFile.name} path={currentPath} onBack={() => setViewingFile(null)} />;
+  if (view.mode === 'file') {
+    return <FileViewer fileName={view.name} path={view.path} onBack={() => navigate(folderUrl(view.path))} />;
   }
 
   return (
@@ -300,11 +286,13 @@ function AppInner() {
       <main className="app-main">
         <ExplorerView
           currentPath={currentPath}
-          folders={folders}
-          files={files}
-          tree={tree}
-          onNavigate={setCurrentPath}
-          onOpenFile={setViewingFile}
+          folders={dir.folders}
+          files={dir.files}
+          tree={dir.tree}
+          status={dir.status}
+          onReload={dir.reload}
+          onNavigate={(p) => navigate(folderUrl(p))}
+          onOpenFile={(f) => navigate(fileUrl(currentPath, f.name))}
           onAction={handleAction}
           onMove={handleMove}
         />

@@ -2,15 +2,26 @@ import type { DirectoryListing, TreeNode, AuthStatus } from './types';
 
 const BASE = '';
 
-export async function listFiles(path: string): Promise<DirectoryListing> {
-  const res = await fetch(`${BASE}/api/files?path=${encodeURIComponent(path)}`);
-  if (!res.ok) throw new Error('Failed to list files');
+// Error carrying the HTTP status so callers can distinguish 401 (auth needed)
+// from 404 (missing) from other failures without string-matching messages.
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+export async function listFiles(path: string, signal?: AbortSignal): Promise<DirectoryListing> {
+  const res = await fetch(`${BASE}/api/files?path=${encodeURIComponent(path)}`, { signal });
+  if (!res.ok) throw new ApiError('Failed to list files', res.status);
   return res.json();
 }
 
-export async function getTree(path = '/'): Promise<{ tree: TreeNode[] }> {
-  const res = await fetch(`${BASE}/api/tree?path=${encodeURIComponent(path)}`);
-  if (!res.ok) throw new Error('Failed to get tree');
+export async function getTree(path = '/', signal?: AbortSignal): Promise<{ tree: TreeNode[] }> {
+  const res = await fetch(`${BASE}/api/tree?path=${encodeURIComponent(path)}`, { signal });
+  if (!res.ok) throw new ApiError('Failed to get tree', res.status);
   return res.json();
 }
 

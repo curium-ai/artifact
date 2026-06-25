@@ -226,14 +226,16 @@ interface EmptyStateProps {
   icon?: ReactNode;
   title: string;
   subtitle?: string;
+  action?: ReactNode;
 }
 
-export function EmptyState({ icon, title, subtitle }: EmptyStateProps) {
+export function EmptyState({ icon, title, subtitle, action }: EmptyStateProps) {
   return (
     <div className="empty-state">
       {icon && <div className="empty-state__icon">{icon}</div>}
       <p className="empty-state__title">{title}</p>
       {subtitle && <p className="empty-state__sub">{subtitle}</p>}
+      {action && <div className="empty-state__action">{action}</div>}
     </div>
   );
 }
