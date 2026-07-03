@@ -526,12 +526,14 @@ def serve_public(file_path: str, artifact_session: Optional[str] = Cookie(None))
     if AUTH_MODE == "google" and not is_authenticated(artifact_session):
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/")
-    resolved = resolve_path(file_path)
-    # Redundant with resolve_path's guard, but local to this sink so CodeQL's
-    # path-injection query recognizes the sanitizer (it doesn't propagate the
-    # barrier across the resolve_path call boundary).
-    if not str(resolved).startswith(os.path.realpath(UPLOAD_DIR) + os.sep):
+    # Inline containment guard (same semantics as resolve_path): CodeQL's
+    # path-injection query doesn't carry the sanitizer across a call boundary,
+    # so guard the exact value that reaches read_text here.
+    base = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(os.path.join(base, file_path.strip("/")))
+    if not candidate.startswith(base + os.sep):
         raise HTTPException(status_code=404, detail="File not found")
+    resolved = Path(candidate)
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     if resolved.suffix.lower() != ".html":
