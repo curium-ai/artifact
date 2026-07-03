@@ -45,7 +45,7 @@ export function FileViewer({ fileName, path, onBack }: FileViewerProps) {
       <div className="viewer__frame">
         <iframe
           src={publicPath}
-          sandbox="allow-scripts allow-same-origin"
+          sandbox="allow-scripts"
           title={fileName}
         />
       </div>
