@@ -527,6 +527,11 @@ def serve_public(file_path: str, artifact_session: Optional[str] = Cookie(None))
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/")
     resolved = resolve_path(file_path)
+    # Redundant with resolve_path's guard, but local to this sink so CodeQL's
+    # path-injection query recognizes the sanitizer (it doesn't propagate the
+    # barrier across the resolve_path call boundary).
+    if not str(resolved).startswith(os.path.realpath(UPLOAD_DIR) + os.sep):
+        raise HTTPException(status_code=404, detail="File not found")
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     if resolved.suffix.lower() != ".html":
