@@ -1,7 +1,7 @@
 import os
 import shutil
 import time
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from urllib.parse import urlencode
 
 from fastmcp import FastMCP
@@ -113,11 +113,13 @@ async def google_callback(request: Request):
 # ---------------------------------------------------------------------------
 
 def _resolve(user_path: str) -> Path:
-    cleaned = PurePosixPath("/" + user_path.strip("/"))
-    resolved = (UPLOAD_DIR / cleaned.relative_to("/")).resolve()
-    if not resolved.is_relative_to(UPLOAD_DIR.resolve()):
+    # realpath + startswith rather than Path.is_relative_to: same containment
+    # semantics, but a form CodeQL recognizes as a path-injection sanitizer.
+    base = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(os.path.join(base, user_path.strip("/")))
+    if candidate != base and not candidate.startswith(base + os.sep):
         raise ValueError("Invalid path")
-    return resolved
+    return Path(candidate)
 
 
 def _format_size(size_bytes: int) -> str:

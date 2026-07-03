@@ -4,7 +4,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -99,11 +99,13 @@ MCP_TOKEN = os.environ.get("ARTIFACT_MCP_TOKEN", "")
 
 
 def resolve_path(user_path: str) -> Path:
-    cleaned = PurePosixPath("/" + user_path.strip("/"))
-    resolved = (UPLOAD_DIR / cleaned.relative_to("/")).resolve()
-    if not resolved.is_relative_to(UPLOAD_DIR.resolve()):
+    # realpath + startswith rather than Path.is_relative_to: same containment
+    # semantics, but a form CodeQL recognizes as a path-injection sanitizer.
+    base = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(os.path.join(base, user_path.strip("/")))
+    if candidate != base and not candidate.startswith(base + os.sep):
         raise HTTPException(status_code=400, detail="Invalid path")
-    return resolved
+    return Path(candidate)
 
 
 def is_authenticated(session_token: Optional[str]) -> bool:
@@ -541,9 +543,12 @@ def serve_public(file_path: str, artifact_session: Optional[str] = Cookie(None))
 if FRONTEND_DIR.exists() and FRONTEND_DIR.is_dir():
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):
-        file_path = (FRONTEND_DIR / full_path).resolve()
-        if not file_path.is_relative_to(FRONTEND_DIR.resolve()):
+        base = os.path.realpath(FRONTEND_DIR)
+        candidate = os.path.realpath(os.path.join(base, full_path))
+        # candidate == base is GET / — falls through to the index.html fallback
+        if candidate != base and not candidate.startswith(base + os.sep):
             raise HTTPException(status_code=404)
+        file_path = Path(candidate)
         if file_path.is_file():
             media_type = None
             if file_path.suffix == ".js":
