@@ -704,3 +704,30 @@ a.breadcrumb__item, a.sidebar-item, .explorer__name-link { text-decoration: none
   .viewer__actions { flex: 1 1 100%; min-width: 0; max-width: 100%; }
   .notification-menu { position: fixed; top: 105px; left: 12px; right: 12px; width: auto; }
 }
+
+/* Discussions stay visually tied to the numbered document markers. */
+.comment-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.comment-heading h2 { margin: 0; }
+.comment-heading .btn { font-size: 12px; padding: 5px 8px; }
+.comment-filters { display: flex; gap: 4px; padding: 3px; background: var(--bg-fill-highlight); border-radius: 9px; }
+.comment-filters button { flex: 1; padding: 7px 5px; border: 0; border-radius: 7px; color: var(--text-secondary); background: transparent; cursor: pointer; font: inherit; font-size: 12px; }
+.comment-filters button[aria-pressed="true"] { background: var(--bg-surface); color: var(--text-primary); box-shadow: 0 1px 3px #0001; }
+.comment-filters span { margin-left: 3px; color: var(--text-secondary); }
+.comment-status { font-size: 12px; line-height: 1.5; color: var(--text-secondary); }
+.comment-status:empty { display: none; }
+.comment-hint, .comment-empty { font-size: 13px; line-height: 1.6; color: var(--text-secondary); margin: 18px 0; }
+.comment-hint span { display: block; font-size: 11px; margin-top: 8px; color: var(--text-secondary); }
+.comment-composer { margin: 16px 0; padding: 12px; border: 1px solid var(--border-primary); border-radius: 12px; }
+.comment-composer .anchor-preview { margin-top: 0; border-color: #79968d; }
+.comment-sidebar textarea:focus { outline: 2px solid #79968d; outline-offset: 2px; }
+.comment-thread { scroll-margin: 140px 0 16px; }
+.comment-thread--active { border-color: #79968d; box-shadow: 0 0 0 1px #79968d20; }
+.thread-anchor { display: flex; align-items: flex-start; gap: 10px; padding: 0 0 10px; line-height: 1.5; }
+.thread-anchor .thread-number { display: flex; align-items: center; justify-content: center; margin: 0; flex: 0 0 24px; height: 24px; border-radius: 50% 50% 50% 3px; background: #eaf1ee; color: #245b50; font-weight: 600; }
+.thread-anchor .thread-quote { margin: 0; color: var(--text-primary); }
+.thread-quote small { display: block; margin-top: 4px; color: var(--text-secondary); font-size: 11px; }
+.comment-sidebar button:focus-visible { outline: 2px solid #79968d; outline-offset: 3px; }
+
+.comment-panel-header { position: sticky; top: -20px; z-index: 2; background: var(--bg-surface); margin: -20px -20px 16px; padding: 20px 20px 12px; border-bottom: 1px solid var(--border-primary); }
+
+.comment-sidebar h2 small, .comment small { color: var(--text-secondary); }
