@@ -124,6 +124,18 @@ the actor is excluded. Notifications and comments commit together. The app polls
 
 ### Migrations and upgrade from SQLite
 
+The Docker image runs `alembic upgrade head` before starting the HTTP server on
+every deploy or restart. A migration failure prevents startup. PostgreSQL migration
+runs are serialized with a session advisory lock, including concurrent starts.
+Render services using this Dockerfile inherit this behavior; a merge triggers it
+only when automatic deploys are enabled and `DATABASE_URL` is configured. A custom
+Docker command overrides this startup path, so include migrations in that command
+or configure a pre-deploy migration job instead.
+
+Schema upgrades do not provision PostgreSQL or import legacy SQLite/files. Those
+remain one-time setup steps below. The importer requires access to the persistent
+disk; Render build and pre-deploy jobs do not mount that disk.
+
 From `backend/`, with `DATABASE_URL` configured:
 
 ```sh

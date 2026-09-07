@@ -1,7 +1,7 @@
 from alembic import context
 from database import url
 from models import Base
-from sqlalchemy import create_engine, pool
+from sqlalchemy import create_engine, pool, text
 
 
 def configure(connection=None):
@@ -27,4 +27,16 @@ else:
         else {}
     )
     with create_engine(url, poolclass=pool.NullPool, connect_args=args).connect() as connection:
-        configure(connection)
+        if connection.dialect.name == "postgresql":
+            # A session lock spans Alembic's per-revision transactions. Concurrent
+            # application starts must not race when creating or advancing the schema.
+            connection.execute(text("SELECT pg_advisory_lock(724196824)"))
+            connection.commit()
+            try:
+                configure(connection)
+            finally:
+                connection.rollback()
+                connection.execute(text("SELECT pg_advisory_unlock(724196824)"))
+                connection.commit()
+        else:
+            configure(connection)
