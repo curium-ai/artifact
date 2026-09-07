@@ -15,7 +15,7 @@ from fastmcp.server.dependencies import get_access_token
 from mcp_auth import ArtifactOAuthProvider
 from settings import MAX_FILE_BYTES, PUBLIC_URL
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.responses import HTMLResponse
 from stores import get_user
 from uploads import UploadRequest, prepare
 
@@ -141,7 +141,7 @@ async def approve_client(request: Request):
         return HTMLResponse("Invalid approval", status_code=400)
     data = auth_provider._store.flow(token, consume=True)
     if not data or "code" not in data:
-        return HTMLResponse("Approval expired. Reconnect your client.", status_code=400)
+        return HTMLResponse("This approval link has already been used or expired. Reconnect your client to start again.", status_code=400)
     if decision == "deny":
         auth_provider._store.flow(data["code"], consume=True)
         return HTMLResponse("Connection canceled. You can close this window.")
@@ -152,8 +152,23 @@ async def approve_client(request: Request):
         params["state"] = data["state"]
     uri = data["redirect_uri"]
     separator = "&" if "?" in uri else "?"
-    return RedirectResponse(uri + separator + urlencode(params), status_code=302,
-                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+    destination = html.escape(uri + separator + urlencode(params), quote=True)
+    # A form-action 'self' policy also covers HTTP redirects in Chromium.
+    # Finish the same-origin POST before navigating to the registered callback.
+    # Keep a visible link for browsers that don't follow the automatic refresh.
+    return HTMLResponse(
+        f"""<!doctype html><html><head><title>Return to your client</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <meta http-equiv="refresh" content="0;url={destination}">
+        <style>body{{font:16px system-ui;background:#f3efea;color:#151515;padding:40px}}
+        main{{max-width:480px;margin:8vh auto;padding:32px;background:white;border-radius:12px}}
+        p{{line-height:1.6}}</style></head><body><main><h1>Client approved</h1>
+        <p>Returning to your client to finish connecting.</p>
+        <p>If nothing happens, <a href="{destination}" rel="noreferrer">return to your client</a>.</p>
+        </main></body></html>""",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                 "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'"},
+    )
 
 
 # ---------------------------------------------------------------------------
