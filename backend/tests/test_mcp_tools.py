@@ -38,22 +38,6 @@ class TestEditFile:
         assert mcp_server.edit_file("/a.html", "", "x")["error"] == "validation_error"
 
 
-class TestAppendFile:
-    def test_chunked_build(self, upload_dir):
-        mcp_server.create_file("/", "big.html", "<html><body>")
-        assert mcp_server.append_file("/big.html", "<p>chunk1</p>")["ok"]
-        assert mcp_server.append_file("/big.html", "</body></html>")["ok"]
-        assert (upload_dir / "big.html").read_text() == "<html><body><p>chunk1</p></body></html>"
-
-    def test_size_cap(self, upload_dir, monkeypatch):
-        make_file(upload_dir, "a.html", "x" * 50)
-        monkeypatch.setattr(mcp_server, "MAX_FILE_SIZE", 60)
-        assert mcp_server.append_file("/a.html", "y" * 20)["error"] == "size_exceeded"
-
-    def test_missing_file(self, upload_dir):
-        assert mcp_server.append_file("/nope.html", "x")["error"] == "not_found"
-
-
 class TestReadFileFromUrl:
     def test_share_link(self, upload_dir):
         make_file(upload_dir, "folder/doc.html", "<h1>shared</h1>")

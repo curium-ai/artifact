@@ -28,3 +28,32 @@ jobs:
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
+
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: artifact
+          POSTGRES_PASSWORD: artifact-test
+          POSTGRES_DB: artifact_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U artifact -d artifact_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://artifact:artifact-test@localhost:5432/artifact_test
+      ARTIFACT_TEST_DATABASE_URL: postgresql+psycopg://artifact:artifact-test@localhost:5432/artifact_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+      - run: alembic -c backend/alembic.ini upgrade head
+      - run: alembic -c backend/alembic.ini check
+      - run: alembic -c backend/alembic.ini downgrade base
+      - run: alembic -c backend/alembic.ini upgrade head
+      - run: alembic -c backend/alembic.ini check
+      - run: pytest backend/tests

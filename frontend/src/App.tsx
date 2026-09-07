@@ -12,6 +12,7 @@ import { PasswordModal } from './components/PasswordModal';
 import { UploadModal } from './components/UploadModal';
 import { NewFolderModal } from './components/NewFolderModal';
 import { DeleteModal } from './components/DeleteModal';
+import { Notifications } from './components/Notifications';
 import { GoogleLoginPage } from './components/GoogleLoginPage';
 
 const STORAGE_KEY = 'artifact-settings';
@@ -44,13 +45,17 @@ function AppInner() {
     if (url === window.location.pathname + window.location.search) return;
     history.pushState(null, '', url);
     setLoc({ dir, file });
+    setReviewId(null);
   }, []);
 
   useEffect(() => {
     if (!window.location.pathname.startsWith('/browse')) {
       history.replaceState(null, '', '/browse');
     }
-    const onPop = () => setLoc(locationFromUrl());
+    const onPop = () => {
+      setLoc(locationFromUrl());
+      setReviewId(new URLSearchParams(location.search).get('artifact'));
+    };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
@@ -60,6 +65,8 @@ function AppInner() {
   }, [currentPath, viewingFile]);
 
   const [isAuth, setIsAuth] = useState(false);
+  const [maxFileBytes, setMaxFileBytes] = useState(0);
+  const [reviewId, setReviewId] = useState(() => new URLSearchParams(location.search).get('artifact'));
   const [authMode, setAuthMode] = useState<'password' | 'google'>('password');
   const [googleClientId, setGoogleClientId] = useState('');
   const [allowedDomain, setAllowedDomain] = useState('');
@@ -96,6 +103,7 @@ function AppInner() {
   useEffect(() => {
     api.checkAuth().then((status: AuthStatus) => {
       setIsAuth(status.authenticated);
+      setMaxFileBytes(status.maxFileBytes);
       setAuthMode(status.authMode);
       if (status.googleClientId) setGoogleClientId(status.googleClientId);
       if (status.allowedDomain) setAllowedDomain(status.allowedDomain);
@@ -262,8 +270,9 @@ function AppInner() {
     );
   }
 
-  if (viewingFile) {
-    return <FileViewer fileName={viewingFile} path={currentPath} onBack={() => navigate(currentPath)} />;
+  if (isAuth && (viewingFile || reviewId)) {
+    return <FileViewer key={reviewId || currentPath + '/' + viewingFile} fileName={viewingFile || 'Artifact'}
+      artifactId={reviewId} path={currentPath} onBack={() => navigate(currentPath)} />;
   }
 
   return (
@@ -280,6 +289,7 @@ function AppInner() {
           </div>
         </div>
         <div className="app-header__right">
+          {isAuth && <Notifications />}
           {authMode === 'google' ? (
             <button className="auth-badge auth-badge--unlocked" onClick={handleLogout}>
               <UnlockIcon width={14} height={14} />
@@ -345,6 +355,7 @@ function AppInner() {
       {showNewFolder && <NewFolderModal onClose={() => setShowNewFolder(false)} onCreate={handleCreateFolder} />}
       {showUpload && (
         <UploadModal
+          maxFileBytes={maxFileBytes}
           onClose={() => setShowUpload(false)}
           onUpload={handleUpload}
           existingNames={files.map(f => f.name)}

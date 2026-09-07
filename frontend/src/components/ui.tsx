@@ -32,6 +32,7 @@ export function NavLink({ href, onNavigate, children, ...rest }: NavLinkProps) {
 // BUTTON
 // ═══════════════════════════════════════
 interface ButtonProps {
+  type?: 'button' | 'submit' | 'reset';
   children?: ReactNode;
   variant?: 'secondary' | 'primary' | 'danger' | 'ghost';
   size?: 'small' | 'medium' | 'large';
@@ -42,9 +43,10 @@ interface ButtonProps {
   title?: string;
 }
 
-export function Button({ children, variant = 'secondary', size = 'medium', icon, onClick, disabled, className = '', title }: ButtonProps) {
+export function Button({ type = 'button', children, variant = 'secondary', size = 'medium', icon, onClick, disabled, className = '', title }: ButtonProps) {
   return (
     <button
+      type={type}
       className={`btn btn--${variant} btn--${size} ${className}`}
       onClick={onClick}
       disabled={disabled}

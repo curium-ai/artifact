@@ -2,15 +2,15 @@ import { useState, useRef } from 'react';
 import { Modal, Button, useToast } from './ui';
 import { UploadIcon, FileHtmlIcon, XIcon } from './Icons';
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
 interface UploadModalProps {
+  maxFileBytes: number;
   onClose: () => void;
   onUpload: (files: File[]) => Promise<boolean>;
   existingNames?: string[];
 }
 
-export function UploadModal({ onClose, onUpload, existingNames = [] }: UploadModalProps) {
+export function UploadModal({ maxFileBytes, onClose, onUpload, existingNames = [] }: UploadModalProps) {
   const [files, setFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
@@ -19,9 +19,9 @@ export function UploadModal({ onClose, onUpload, existingNames = [] }: UploadMod
 
   const handleFiles = (fileList: FileList) => {
     const htmlFiles = Array.from(fileList).filter(f => f.name.endsWith('.html'));
-    const accepted = htmlFiles.filter(f => f.size <= MAX_FILE_SIZE);
+    const accepted = htmlFiles.filter(f => f.size <= maxFileBytes);
     if (accepted.length < htmlFiles.length) {
-      toast(`Skipped ${htmlFiles.length - accepted.length} file(s) over 10 MB`, 'error');
+      toast(`Skipped ${htmlFiles.length - accepted.length} file(s) over ${maxFileBytes / 1024 / 1024} MiB`, 'error');
     }
     setFiles(prev => [...prev, ...accepted]);
   };
@@ -44,7 +44,7 @@ export function UploadModal({ onClose, onUpload, existingNames = [] }: UploadMod
         <input ref={inputRef} type="file" accept=".html" multiple hidden onChange={e => e.target.files && handleFiles(e.target.files)} />
         <UploadIcon width={28} height={28} style={{ color: 'var(--text-tertiary)' }} />
         <p className="upload-drop-area__text">Click to browse or drag files here</p>
-        <p className="upload-drop-area__hint">Only .html files, max 10 MB each</p>
+        <p className="upload-drop-area__hint">Only .html files, max {maxFileBytes / 1024 / 1024} MiB each</p>
       </div>
 
       {files.length > 0 && (

@@ -1,129 +1,23 @@
-import os
 import secrets
-import sqlite3
 import time
 from urllib.parse import urlencode
 
 import httpx
-from pydantic import AnyUrl
-from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from database import lock_writes, transaction
+from fastmcp.server.auth import AccessToken, OAuthProvider
+from fastmcp.server.auth.auth import AuthorizationCode, ClientRegistrationOptions, RefreshToken
 from mcp.server.auth.provider import AuthorizationParams
-from fastmcp.server.auth import OAuthProvider, AccessToken
-from fastmcp.server.auth.auth import AuthorizationCode, RefreshToken, ClientRegistrationOptions
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from models import OAuthAccess, OAuthRefresh
+from pydantic import AnyUrl
+from sqlalchemy import select
+from stores import TokenStore, digest, get_user
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
-SESSION_TTL = 86400  # 24 hours, matches main app
-
-
-class TokenStore:
-    """SQLite-backed store for OAuth clients and tokens.
-
-    Tokens must survive process restarts (Render restarts dynos freely),
-    so anything with a lifetime beyond a single auth flow lives here.
-    """
-
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        with self._connect() as db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS mcp_clients (
-                    client_id TEXT PRIMARY KEY,
-                    data TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS mcp_access_tokens (
-                    token TEXT PRIMARY KEY,
-                    data TEXT NOT NULL,
-                    expires_at REAL
-                );
-                CREATE TABLE IF NOT EXISTS mcp_refresh_tokens (
-                    token TEXT PRIMARY KEY,
-                    data TEXT NOT NULL,
-                    email TEXT NOT NULL
-                );
-                """
-            )
-
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
-
-    # -- clients --
-
-    def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT data FROM mcp_clients WHERE client_id = ?", (client_id,)
-            ).fetchone()
-        return OAuthClientInformationFull.model_validate_json(row[0]) if row else None
-
-    def save_client(self, client_info: OAuthClientInformationFull) -> None:
-        with self._connect() as db:
-            db.execute(
-                "INSERT OR REPLACE INTO mcp_clients (client_id, data) VALUES (?, ?)",
-                (client_info.client_id, client_info.model_dump_json()),
-            )
-
-    # -- access tokens --
-
-    def get_access_token(self, token: str) -> AccessToken | None:
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT data, expires_at FROM mcp_access_tokens WHERE token = ?",
-                (token,),
-            ).fetchone()
-            if not row:
-                return None
-            data, expires_at = row
-            if expires_at is not None and time.time() > expires_at:
-                db.execute("DELETE FROM mcp_access_tokens WHERE token = ?", (token,))
-                return None
-        return AccessToken.model_validate_json(data)
-
-    def save_access_token(self, at: AccessToken) -> None:
-        with self._connect() as db:
-            db.execute(
-                "INSERT OR REPLACE INTO mcp_access_tokens (token, data, expires_at) VALUES (?, ?, ?)",
-                (at.token, at.model_dump_json(), at.expires_at),
-            )
-            db.execute(
-                "DELETE FROM mcp_access_tokens WHERE expires_at IS NOT NULL AND expires_at < ?",
-                (time.time(),),
-            )
-
-    def delete_access_token(self, token: str) -> None:
-        with self._connect() as db:
-            db.execute("DELETE FROM mcp_access_tokens WHERE token = ?", (token,))
-
-    # -- refresh tokens --
-
-    def get_refresh_token(self, token: str) -> RefreshToken | None:
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT data FROM mcp_refresh_tokens WHERE token = ?", (token,)
-            ).fetchone()
-        return RefreshToken.model_validate_json(row[0]) if row else None
-
-    def get_refresh_email(self, token: str) -> str | None:
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT email FROM mcp_refresh_tokens WHERE token = ?", (token,)
-            ).fetchone()
-        return row[0] if row else None
-
-    def save_refresh_token(self, rt: RefreshToken, email: str) -> None:
-        with self._connect() as db:
-            db.execute(
-                "INSERT OR REPLACE INTO mcp_refresh_tokens (token, data, email) VALUES (?, ?, ?)",
-                (rt.token, rt.model_dump_json(), email),
-            )
-
-    def delete_refresh_token(self, token: str) -> None:
-        with self._connect() as db:
-            db.execute("DELETE FROM mcp_refresh_tokens WHERE token = ?", (token,))
+SESSION_TTL = 86400  # 24 hours; clients refresh without another Google login
 
 
 class ArtifactOAuthProvider(OAuthProvider):
@@ -136,7 +30,7 @@ class ArtifactOAuthProvider(OAuthProvider):
         google_client_id: str,
         google_client_secret: str,
         allowed_domain: str,
-        db_path: str,
+        db_path: str | None = None,
     ):
         super().__init__(
             base_url=base_url,
@@ -146,12 +40,8 @@ class ArtifactOAuthProvider(OAuthProvider):
         self.google_client_secret = google_client_secret
         self.allowed_domain = allowed_domain.lower()
 
-        # Long-lived state (clients, tokens) is persisted to SQLite so it
-        # survives restarts; only mid-flow state stays in memory.
+        # Credentials and in-flight authorization survive restarts in Postgres.
         self._store = TokenStore(db_path)
-        self._pending_google: dict[str, dict] = {}
-        self._auth_codes: dict[str, AuthorizationCode] = {}
-        self._code_emails: dict[str, str] = {}
 
     # -- client registration --------------------------------------------------
 
@@ -168,7 +58,7 @@ class ArtifactOAuthProvider(OAuthProvider):
         self, client: OAuthClientInformationFull, params: AuthorizationParams
     ) -> str:
         google_state = secrets.token_urlsafe(32)
-        self._pending_google[google_state] = {
+        pending = {
             "client_id": client.client_id,
             "redirect_uri": str(params.redirect_uri),
             "mcp_state": params.state,
@@ -179,6 +69,8 @@ class ArtifactOAuthProvider(OAuthProvider):
             "expires": time.time() + 600,
         }
 
+        self._store.save_flow(google_state, pending, pending["expires"])
+
         callback_url = str(self.base_url).rstrip("/") + "/google/callback"
         google_params = {
             "client_id": self.google_client_id,
@@ -186,14 +78,12 @@ class ArtifactOAuthProvider(OAuthProvider):
             "response_type": "code",
             "scope": "openid email",
             "state": google_state,
-            "access_type": "offline",
-            "prompt": "consent",
         }
         return f"{GOOGLE_AUTH_URL}?{urlencode(google_params)}"
 
     async def handle_google_callback(self, code: str, state: str) -> tuple[str, str, str | None]:
         """Exchange Google auth code, verify domain, return (mcp_code, redirect_uri, mcp_state)."""
-        pending = self._pending_google.pop(state, None)
+        pending = self._store.flow(state, consume=True)
         if not pending or time.time() > pending["expires"]:
             raise ValueError("Invalid or expired authorization state")
 
@@ -222,11 +112,17 @@ class ArtifactOAuthProvider(OAuthProvider):
 
         email = userinfo.get("email", "")
         domain = email.split("@")[-1].lower()
+        if not userinfo.get("email_verified") or not userinfo.get("sub"):
+            raise PermissionError("A verified Google identity is required")
         if domain != self.allowed_domain:
             raise PermissionError(f"Only @{self.allowed_domain} accounts are allowed")
 
+        with transaction() as db:
+            lock_writes(db)
+            get_user(db, email, userinfo["sub"], userinfo.get("name"))
+
         mcp_code = secrets.token_urlsafe(32)
-        self._auth_codes[mcp_code] = AuthorizationCode(
+        authorization = AuthorizationCode(
             code=mcp_code,
             scopes=pending["scopes"],
             expires_at=time.time() + 300,
@@ -236,7 +132,8 @@ class ArtifactOAuthProvider(OAuthProvider):
             redirect_uri_provided_explicitly=pending["redirect_uri_provided_explicitly"],
             resource=pending["resource"],
         )
-        self._code_emails[mcp_code] = email
+        self._store.save_flow(mcp_code, {"authorization": authorization.model_dump(mode="json"), "email": email},
+                              authorization.expires_at)
 
         return mcp_code, pending["redirect_uri"], pending.get("mcp_state")
 
@@ -245,18 +142,17 @@ class ArtifactOAuthProvider(OAuthProvider):
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> AuthorizationCode | None:
-        ac = self._auth_codes.get(authorization_code)
-        if ac and time.time() <= ac.expires_at:
-            return ac
-        self._auth_codes.pop(authorization_code, None)
-        self._code_emails.pop(authorization_code, None)
-        return None
+        data = self._store.flow(authorization_code)
+        ac = AuthorizationCode.model_validate(data["authorization"]) if data else None
+        return ac if ac and ac.client_id == client.client_id else None
 
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        email = self._code_emails.pop(authorization_code.code, "unknown")
-        self._auth_codes.pop(authorization_code.code, None)
+        data = self._store.flow(authorization_code.code, consume=True)
+        if not data:
+            raise ValueError("Authorization code expired or already used")
+        email = data["email"]
 
         access_token = secrets.token_urlsafe(32)
         self._store.save_access_token(AccessToken(
@@ -289,7 +185,8 @@ class ArtifactOAuthProvider(OAuthProvider):
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        return self._store.get_refresh_token(refresh_token)
+        token = self._store.get_refresh_token(refresh_token)
+        return token if token and token.client_id == client.client_id else None
 
     async def exchange_refresh_token(
         self,
@@ -297,32 +194,28 @@ class ArtifactOAuthProvider(OAuthProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        email = self._store.get_refresh_email(refresh_token.token) or "unknown"
-        self._store.delete_refresh_token(refresh_token.token)
-
-        new_access = secrets.token_urlsafe(32)
-        effective_scopes = scopes or refresh_token.scopes
-        self._store.save_access_token(AccessToken(
-            token=new_access,
-            client_id=client.client_id or "",
-            scopes=effective_scopes,
-            expires_at=int(time.time()) + SESSION_TTL,
-            claims={"email": email},
-        ))
-
-        new_refresh = secrets.token_urlsafe(32)
-        self._store.save_refresh_token(RefreshToken(
-            token=new_refresh,
-            client_id=client.client_id or "",
-            scopes=effective_scopes,
-        ), email)
-
-        return OAuthToken(
-            access_token=new_access,
-            token_type="Bearer",
-            expires_in=SESSION_TTL,
-            refresh_token=new_refresh,
-        )
+        # Consume and replace refresh credentials in one transaction. Concurrent
+        # refreshes cannot both spend the same token or lose it halfway through.
+        with transaction() as db:
+            row = db.scalar(select(OAuthRefresh).where(
+                OAuthRefresh.token == digest(refresh_token.token)).with_for_update())
+            if not row or row.data["client_id"] != client.client_id:
+                raise ValueError("Invalid refresh token; reconnect this client")
+            get_user(db, row.email)
+            if not set(scopes).issubset(set(refresh_token.scopes)):
+                raise ValueError("Refresh cannot expand scopes")
+            new_access, new_refresh = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+            at = AccessToken(token=new_access, client_id=client.client_id or "",
+                             scopes=scopes or refresh_token.scopes,
+                             expires_at=int(time.time()) + SESSION_TTL, claims={"email": row.email})
+            rt = RefreshToken(token=new_refresh, client_id=client.client_id or "", scopes=at.scopes)
+            db.add(OAuthAccess(token=digest(new_access), data=at.model_dump(mode="json", exclude={"token"}),
+                               expires_at=at.expires_at))
+            db.add(OAuthRefresh(token=digest(new_refresh), data=rt.model_dump(mode="json", exclude={"token"}),
+                                email=row.email))
+            db.delete(row)
+        return OAuthToken(access_token=new_access, token_type="Bearer", expires_in=SESSION_TTL,
+                          refresh_token=new_refresh)
 
     # -- revocation ------------------------------------------------------------
 

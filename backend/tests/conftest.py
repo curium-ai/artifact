@@ -20,12 +20,21 @@ os.environ["ARTIFACT_AUTH_MODE"] = "password"
 # assertions see only test files.
 os.environ["ARTIFACT_MCP_AUTH_DB"] = os.path.join(tempfile.mkdtemp(prefix="artifact-test-db-"), "auth.db")
 
+os.environ["DATABASE_URL"] = os.environ.get("ARTIFACT_TEST_DATABASE_URL", "sqlite:///" + tempfile.mktemp(suffix=".db"))
+os.environ["ARTIFACT_PUBLIC_URL"] = "http://testserver"
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pytest  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+import pytest
+from alembic import command
+from alembic.config import Config
+from database import engine
+from fastapi.testclient import TestClient
+from models import Base
+from sqlalchemy import delete
 
-import main  # noqa: E402
+command.upgrade(Config(str(Path(__file__).parent.parent / "alembic.ini")), "head")
+import main
 
 
 @pytest.fixture(autouse=True)
@@ -35,8 +44,9 @@ def upload_dir():
     yield d
     for item in d.iterdir():
         shutil.rmtree(item) if item.is_dir() else item.unlink()
-    with main.session_store._connect() as db:
-        db.execute("DELETE FROM web_sessions")
+    with engine.begin() as db:
+        for table in reversed(Base.metadata.sorted_tables):
+            db.execute(delete(table))
 
 
 @pytest.fixture()

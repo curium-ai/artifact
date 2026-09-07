@@ -1,3 +1,6 @@
+from typing import ClassVar
+
+
 def make_file(upload_dir, rel, content="<h1>hi</h1>"):
     p = upload_dir / rel.lstrip("/")
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -37,7 +40,7 @@ class TestUpload:
         )
         assert res.status_code == 200
         assert res.json()["count"] == 3
-        assert sorted(p.name for p in upload_dir.iterdir()) == ["a.html", "b.html", "c.html"]
+        assert sorted(p.name for p in upload_dir.iterdir() if not p.name.startswith(".")) == ["a.html", "b.html", "c.html"]
 
     def test_upload_requires_auth(self, client):
         res = client.post(
@@ -93,8 +96,8 @@ class TestPublicView:
 
 
 class TestMCPBearerAuth:
-    RPC = {"jsonrpc": "2.0", "method": "ping", "id": 1}
-    ACCEPT = {"Accept": "application/json, text/event-stream"}
+    RPC: ClassVar = {"jsonrpc": "2.0", "method": "ping", "id": 1}
+    ACCEPT: ClassVar = {"Accept": "application/json, text/event-stream"}
 
     def test_missing_token_401(self, client):
         assert client.post("/mcp", json=self.RPC, headers=self.ACCEPT).status_code == 401

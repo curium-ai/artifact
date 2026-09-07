@@ -1,14 +1,22 @@
+import hashlib
+import html
 import os
-import shutil
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlencode
 
+from artifacts import artifact_for_path, object_path, publish, relocate, remove, resolve, sync_alias
+from database import lock_writes, transaction
+from fastapi import HTTPException
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_access_token
+from mcp_auth import ArtifactOAuthProvider
+from settings import MAX_FILE_BYTES, PUBLIC_URL
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
-
-from mcp_auth import ArtifactOAuthProvider
+from stores import get_user
+from uploads import UploadRequest, prepare
 
 UPLOAD_DIR = Path(
     os.environ.get(
@@ -16,15 +24,12 @@ UPLOAD_DIR = Path(
         os.path.join(os.path.dirname(__file__), "uploads"),
     )
 )
-MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_FILE_SIZE = MAX_FILE_BYTES
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 ALLOWED_DOMAIN = os.environ.get("ARTIFACT_ALLOWED_DOMAIN", "")
-MCP_BASE_URL = os.environ.get("ARTIFACT_MCP_BASE_URL", "http://localhost:8000/mcp")
-# Lives inside the upload dir by default so it lands on the persistent disk in
-# production; dotfiles are hidden from all file listings.
-MCP_AUTH_DB = os.environ.get("ARTIFACT_MCP_AUTH_DB", str(UPLOAD_DIR / ".mcp_auth.db"))
+MCP_BASE_URL = os.environ.get("ARTIFACT_MCP_BASE_URL", PUBLIC_URL + "/mcp")
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +43,6 @@ if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and ALLOWED_DOMAIN:
         google_client_id=GOOGLE_CLIENT_ID,
         google_client_secret=GOOGLE_CLIENT_SECRET,
         allowed_domain=ALLOWED_DOMAIN,
-        db_path=MCP_AUTH_DB,
     )
 
 
@@ -50,12 +54,13 @@ mcp = FastMCP(
     "artifact",
     instructions=(
         "Manage HTML files on Artifact. Files are organized in a folder tree. "
-        "Only .html files are supported, max 10 MB each. "
+        f"Only .html files are supported, max {MAX_FILE_BYTES} bytes each. "
         "Paths use forward slashes and start from root /. "
         "To modify an existing file, prefer edit_file (exact string replacement) "
-        "over update_file — do not resend the whole document for small changes. "
-        "To create a large document, call create_file with the first chunk and "
-        "append_file for each following chunk. "
+        "for small changes. "
+        "For uploads and replacements, write the file locally, calculate its byte size and SHA-256, "
+        "then call prepare_upload. Transfer the file directly to the returned URL using curl --upload-file. "
+        "Never send whole document contents through tool arguments. "
         "To read a document from an Artifact share link (https://<host>/v/...), "
         "use read_file_from_url."
     ),
@@ -78,7 +83,7 @@ async def google_callback(request: Request):
 
     if error:
         return HTMLResponse(
-            f"<h1>Authentication failed</h1><p>{error}</p>", status_code=403
+            f"<h1>Authentication failed</h1><p>{html.escape(error)}</p>", status_code=403
         )
     if not code or not state:
         return HTMLResponse(
@@ -91,11 +96,11 @@ async def google_callback(request: Request):
         )
     except PermissionError as e:
         return HTMLResponse(
-            f"<h1>Access denied</h1><p>{e}</p>", status_code=403
+            f"<h1>Access denied</h1><p>{html.escape(str(e))}</p>", status_code=403
         )
-    except Exception as e:
+    except (ValueError, RuntimeError) as e:
         return HTMLResponse(
-            f"<h1>Authentication error</h1><p>{e}</p>", status_code=400
+            f"<h1>Authentication error</h1><p>{html.escape(str(e))}</p>", status_code=400
         )
 
     params = {"code": mcp_code}
@@ -113,13 +118,10 @@ async def google_callback(request: Request):
 # ---------------------------------------------------------------------------
 
 def _resolve(user_path: str) -> Path:
-    # realpath + startswith rather than Path.is_relative_to: same containment
-    # semantics, but a form CodeQL recognizes as a path-injection sanitizer.
-    base = os.path.realpath(UPLOAD_DIR)
-    candidate = os.path.realpath(os.path.join(base, user_path.strip("/")))
-    if candidate != base and not candidate.startswith(base + os.sep):
-        raise ValueError("Invalid path")
-    return Path(candidate)
+    try:
+        return resolve(user_path)
+    except HTTPException as error:
+        raise ValueError(error.detail) from error
 
 
 def _format_size(size_bytes: int) -> str:
@@ -212,7 +214,7 @@ def _read_file(path: str) -> dict:
     return {
         "name": resolved.name,
         "path": path,
-        "content": resolved.read_text(encoding="utf-8", errors="replace"),
+        "content": object_path(artifact_for_path(path).current_revision_id).read_text(encoding="utf-8", errors="replace"),
         "size": _format_size(stat.st_size),
         "modified": _format_time_ago(stat.st_mtime),
         "bytes": stat.st_size,
@@ -228,7 +230,7 @@ def read_file(path: str) -> dict:
 @mcp.tool()
 def read_file_from_url(url: str) -> dict:
     """Read the Artifact document behind a share link (https://<host>/v/<path>)."""
-    from urllib.parse import urlparse, unquote
+    from urllib.parse import unquote, urlparse
 
     path = unquote(urlparse(url).path)
     if not path.startswith("/v/"):
@@ -239,50 +241,23 @@ def read_file_from_url(url: str) -> dict:
     return _read_file(path[2:])  # strip "/v", keep leading slash
 
 
-@mcp.tool()
-def create_file(path: str, filename: str, content: str) -> dict:
-    """Create a new HTML file. path is the directory, filename must end in .html."""
-    if not filename.endswith(".html"):
-        return {"error": "validation_error", "detail": "Filename must end in .html"}
-    if "/" in filename:
-        return {"error": "validation_error", "detail": "Filename must not contain /"}
-    if len(content.encode("utf-8")) > MAX_FILE_SIZE:
-        return {"error": "size_exceeded", "detail": "Content exceeds 10 MB limit"}
-
-    try:
-        resolved = _resolve(path)
-    except ValueError:
-        return {"error": "invalid_path", "detail": "Path must not escape the upload directory"}
-
-    resolved.mkdir(parents=True, exist_ok=True)
-    file_path = resolved / filename
-    if file_path.exists():
-        return {"error": "already_exists", "detail": f"{filename} already exists at {path}"}
-
-    file_path.write_text(content, encoding="utf-8")
-    stat = file_path.stat()
-    return {"ok": True, "name": filename, "path": path, "size": _format_size(stat.st_size), "bytes": stat.st_size}
+def actor_id():
+    token = get_access_token()
+    if auth_provider and not token:
+        raise PermissionError("MCP authentication required")
+    email = token.claims.get("email") if token else None
+    with transaction() as db:
+        lock_writes(db)
+        return get_user(db, email).id
 
 
 @mcp.tool()
-def update_file(path: str, content: str) -> dict:
-    """Overwrite an existing HTML file. path should be like /folder/file.html"""
-    if len(content.encode("utf-8")) > MAX_FILE_SIZE:
-        return {"error": "size_exceeded", "detail": "Content exceeds 10 MB limit"}
-
-    try:
-        resolved = _resolve(path)
-    except ValueError:
-        return {"error": "invalid_path", "detail": "Path must not escape the upload directory"}
-
-    if not resolved.exists() or not resolved.is_file():
-        return {"error": "not_found", "detail": f"File {path} not found"}
-    if resolved.suffix.lower() != ".html":
-        return {"error": "validation_error", "detail": "Only .html files can be updated"}
-
-    resolved.write_text(content, encoding="utf-8")
-    stat = resolved.stat()
-    return {"ok": True, "name": resolved.name, "path": path, "size": _format_size(stat.st_size), "bytes": stat.st_size}
+def prepare_upload(path: str, size: int, sha256: str, intent: str = "create") -> dict:
+    """Prepare an upload of a local HTML file. path includes filename. Pass its size
+    in bytes and lowercase SHA-256. Use intent='replace' to replace an existing file.
+    Send file bytes to the returned uploadUrl with curl --fail-with-body --upload-file.
+    Never pass HTML content to this tool. The response from PUT contains the review URL."""
+    return prepare(UploadRequest(path=path, size=size, sha256=sha256, intent=intent), actor_id())
 
 
 @mcp.tool()
@@ -301,7 +276,8 @@ def edit_file(path: str, old_str: str, new_str: str, replace_all: bool = False) 
     if not resolved.is_file() or resolved.suffix.lower() != ".html":
         return {"error": "not_found", "detail": f"File {path} not found"}
 
-    content = resolved.read_text(encoding="utf-8", errors="replace")
+    artifact = artifact_for_path(path)
+    content = object_path(artifact.current_revision_id).read_text(encoding="utf-8", errors="replace")
     count = content.count(old_str)
     if count == 0:
         return {
@@ -316,52 +292,31 @@ def edit_file(path: str, old_str: str, new_str: str, replace_all: bool = False) 
 
     new_content = content.replace(old_str, new_str, -1 if replace_all else 1)
     if len(new_content.encode("utf-8")) > MAX_FILE_SIZE:
-        return {"error": "size_exceeded", "detail": "Result exceeds 10 MB limit"}
+        return {"error": "size_exceeded", "detail": "Result exceeds configured size limit"}
 
-    resolved.write_text(new_content, encoding="utf-8")
-    return {"ok": True, "path": path, "replacements": count if replace_all else 1}
-
-
-@mcp.tool()
-def append_file(path: str, content: str) -> dict:
-    """Append content to the end of an existing HTML file. Use this to build large
-    documents in chunks: create_file with the first chunk, then append_file for each
-    following chunk."""
-    if not content:
-        return {"error": "validation_error", "detail": "content must not be empty"}
-
+    content_bytes = new_content.encode("utf-8")
+    staging = UPLOAD_DIR / ".staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=staging)
     try:
-        resolved = _resolve(path)
-    except ValueError:
-        return {"error": "invalid_path", "detail": "Path must not escape the upload directory"}
-
-    if not resolved.is_file() or resolved.suffix.lower() != ".html":
-        return {"error": "not_found", "detail": f"File {path} not found"}
-
-    if resolved.stat().st_size + len(content.encode("utf-8")) > MAX_FILE_SIZE:
-        return {"error": "size_exceeded", "detail": "Result would exceed 10 MB limit"}
-
-    # ponytail: append-in-place — a viewer refreshing mid-build sees a partial doc
-    # briefly; switch to tmp-file+rename commit if that ever matters.
-    with open(resolved, "a", encoding="utf-8") as f:
-        f.write(content)
-    stat = resolved.stat()
-    return {"ok": True, "path": path, "size": _format_size(stat.st_size), "bytes": stat.st_size}
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content_bytes)
+        author = actor_id()
+        with transaction() as db:
+            result = publish(db, path, temporary, author, artifact.current_revision_id,
+                             hashlib.sha256(content_bytes).hexdigest(), len(content_bytes))
+        sync_alias(result)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return {"ok": True, "path": path, "replacements": count if replace_all else 1}
 
 
 @mcp.tool()
 def delete_file(path: str, filename: str) -> dict:
     """Delete an HTML file. path is the directory, filename is the file to delete."""
-    try:
-        resolved = _resolve(path)
-    except ValueError:
-        return {"error": "invalid_path", "detail": "Path must not escape the upload directory"}
-
-    target = resolved / filename
-    if not target.exists() or not target.is_file():
-        return {"error": "not_found", "detail": f"File {filename} not found at {path}"}
-
-    target.unlink()
+    if not filename or "/" in filename or "\\" in filename:
+        raise ValueError("Invalid filename")
+    remove(path.rstrip("/") + "/" + filename)
     return {"ok": True, "name": filename, "path": path}
 
 
@@ -387,64 +342,26 @@ def create_folder(path: str, name: str) -> dict:
 @mcp.tool()
 def delete_folder(path: str) -> dict:
     """Delete a folder and all its contents recursively."""
-    try:
-        resolved = _resolve(path)
-    except ValueError:
-        return {"error": "invalid_path", "detail": "Path must not escape the upload directory"}
-
-    if not resolved.exists() or not resolved.is_dir():
-        return {"error": "not_found", "detail": f"Folder {path} not found"}
-    if resolved == UPLOAD_DIR.resolve():
-        return {"error": "validation_error", "detail": "Cannot delete the root upload directory"}
-
-    shutil.rmtree(resolved)
+    remove(path)
     return {"ok": True, "path": path}
 
 
 @mcp.tool()
 def rename(path: str, old_name: str, new_name: str) -> dict:
     """Rename a file or folder. path is the parent directory."""
-    if not old_name or not new_name or "/" in new_name:
-        return {"error": "validation_error", "detail": "Invalid names"}
-
-    try:
-        resolved = _resolve(path)
-    except ValueError:
-        return {"error": "invalid_path", "detail": "Path must not escape the upload directory"}
-
-    old_path = resolved / old_name
-    new_path = resolved / new_name
-    if not old_path.exists():
-        return {"error": "not_found", "detail": f"{old_name} not found at {path}"}
-    if new_path.exists():
-        return {"error": "already_exists", "detail": f"{new_name} already exists at {path}"}
-
-    old_path.rename(new_path)
-    return {"ok": True, "old_name": old_name, "new_name": new_name, "path": path}
+    if any(not n or "/" in n or "\\" in n for n in (old_name, new_name)):
+        raise ValueError("Invalid names")
+    relocate(path.rstrip("/") + "/" + old_name, path.rstrip("/") + "/" + new_name)
+    return {"ok": True}
 
 
 @mcp.tool()
 def move(from_path: str, name: str, to_path: str) -> dict:
     """Move a file or folder to a different directory."""
-    if not name:
-        return {"error": "validation_error", "detail": "No item specified"}
-
-    try:
-        source_dir = _resolve(from_path)
-        dest_dir = _resolve(to_path)
-    except ValueError:
-        return {"error": "invalid_path", "detail": "Path must not escape the upload directory"}
-
-    source = source_dir / name
-    dest = dest_dir / name
-    if not source.exists():
-        return {"error": "not_found", "detail": f"{name} not found at {from_path}"}
-    if dest.exists():
-        return {"error": "already_exists", "detail": f"{name} already exists at {to_path}"}
-
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source), str(dest))
-    return {"ok": True, "name": name, "from_path": from_path, "to_path": to_path}
+    if not name or "/" in name or "\\" in name:
+        raise ValueError("Invalid name")
+    relocate(from_path.rstrip("/") + "/" + name, to_path.rstrip("/") + "/" + name)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

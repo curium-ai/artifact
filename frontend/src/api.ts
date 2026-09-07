@@ -114,3 +114,15 @@ export async function moveItem(fromPath: string, name: string, toPath: string): 
     throw new Error('Failed to move');
   }
 }
+
+export async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method, headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(typeof data.detail === 'string' ? data.detail : 'Request failed');
+  }
+  return res.json();
+}
