@@ -166,8 +166,15 @@ def test_browser_approval_is_required_and_single_use(monkeypatch):
             return await mcp_server.approve_client(request)
 
         response = await post()
-        assert response.status_code == 302
-        assert response.headers["location"] == "http://localhost:1234/callback?code=approved-code&state=client-state"
+        assert response.status_code == 200
+        assert "location" not in response.headers
+        markup = response.body.decode()
+        destination = "http://localhost:1234/callback?code=approved-code&amp;state=client-state"
+        assert f'content="0;url={destination}"' in markup
+        assert f'href="{destination}"' in markup
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["referrer-policy"] == "no-referrer"
+        assert "form-action 'none'" in response.headers["content-security-policy"]
         assert (await post()).status_code == 400
 
     asyncio.run(flow())
