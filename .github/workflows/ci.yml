@@ -6,6 +6,26 @@ on:
   pull_request:
 
 jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: sqlite:////tmp/artifact-runtime.db
+      ARTIFACT_AUTH_MODE: google
+      GOOGLE_CLIENT_ID: synthetic
+      GOOGLE_CLIENT_SECRET: synthetic
+      ARTIFACT_MCP_BASE_URL: http://localhost:8000/mcp
+      ARTIFACT_ALLOWED_DOMAIN: example.test
+      PYTHONPATH: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m venv /tmp/artifact-runtime
+      - run: /tmp/artifact-runtime/bin/pip install -r backend/requirements.txt
+      - run: /tmp/artifact-runtime/bin/alembic -c backend/alembic.ini upgrade head
+      - run: /tmp/artifact-runtime/bin/python -c "import main"
+
   backend:
     runs-on: ubuntu-latest
     steps:
