@@ -136,6 +136,16 @@ Schema upgrades do not provision PostgreSQL or import legacy SQLite/files. Those
 remain one-time setup steps below. The importer requires access to the persistent
 disk; Render build and pre-deploy jobs do not mount that disk.
 
+For a legacy deployment where the platform stops the old instance before mounting
+its disk in the replacement, a one-time Docker command of
+`python -u cutover_legacy.py` can perform the cutover before opening the HTTP port.
+Apply schema migrations in a pre-deploy job first. This script takes and verifies
+a SQLite backup and an HTML archive under the private `.cutover-backups` directory,
+imports existing records, and verifies every artifact hash plus legacy sessions
+and client registrations before starting Uvicorn. Any failure prevents startup.
+A completion marker binds retries to the same database. Restore the normal Docker
+command after the first successful deploy; retain the backups for rollback.
+
 From `backend/`, with `DATABASE_URL` configured:
 
 ```sh
