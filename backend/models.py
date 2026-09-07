@@ -31,6 +31,7 @@ class User(Base):
 
 class WebSession(Base):
     __tablename__ = "web_sessions"
+    family_id: Mapped[str] = mapped_column(String(64), default=new_id, index=True)
     token: Mapped[str] = mapped_column(String(64), primary_key=True)
     email: Mapped[str | None] = mapped_column(String(320))
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))

@@ -1,4 +1,5 @@
 import hashlib
+import secrets
 import time
 
 from database import lock_writes, transaction
@@ -50,6 +51,33 @@ class SessionStore:
             user = get_user(db, email, sub, name)
             db.merge(WebSession(token=digest(token), email=email, user_id=user.id, expires_at=expires_at))
 
+    def renew(self, token, ttl):
+        with transaction() as db:
+            row = db.scalar(select(WebSession).where(WebSession.token == digest(token)).with_for_update())
+            now = time.time()
+            if not row or row.expires_at <= now:
+                return None
+            user = db.get(User, row.user_id)
+            if not user or not user.active:
+                return None
+            result = {"email": row.email, "user_id": user.id, "cookie": None}
+            # Refresh once per day. A short grace period keeps concurrent requests
+            # working while the browser adopts the newly generated credential.
+            if row.expires_at < now + ttl - 86400:
+                replacement = secrets.token_urlsafe(32)
+                db.add(
+                    WebSession(
+                        token=digest(replacement),
+                        email=row.email,
+                        user_id=user.id,
+                        family_id=row.family_id,
+                        expires_at=now + ttl,
+                    )
+                )
+                row.expires_at = min(row.expires_at, now + 60)
+                result["cookie"] = replacement
+            return result
+
     def touch(self, token, new_expires_at):
         with transaction() as db:
             row = db.scalar(select(WebSession).where(WebSession.token == digest(token)).with_for_update())
@@ -63,7 +91,9 @@ class SessionStore:
 
     def delete(self, token):
         with transaction() as db:
-            db.execute(delete(WebSession).where(WebSession.token == digest(token)))
+            row = db.get(WebSession, digest(token))
+            if row:
+                db.execute(delete(WebSession).where(WebSession.family_id == row.family_id))
 
 
 class TokenStore:

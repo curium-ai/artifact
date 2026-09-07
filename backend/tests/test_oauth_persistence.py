@@ -114,3 +114,77 @@ def test_expired_access_is_rejected():
         AccessToken(token="expired", client_id="test-client", scopes=[], expires_at=int(time.time()) - 1)
     )
     assert asyncio.run(one.load_access_token("expired")) is None
+
+
+def test_browser_approval_is_required_and_single_use(monkeypatch):
+    import re
+    from urllib.parse import urlencode
+
+    import mcp_server
+    from starlette.requests import Request
+
+    one = provider()
+    monkeypatch.setattr(mcp_server, "auth_provider", one)
+    one._store.save_client(client().model_copy(update={"client_name": "<untrusted client>"}))
+    one._store.save_flow(
+        "approved-code",
+        {"authorization": {"client_id": "test-client"}, "email": "alice@example.test"},
+        time.time() + 300,
+    )
+
+    async def callback(code, state):
+        return "approved-code", "http://localhost:1234/callback", "client-state"
+
+    monkeypatch.setattr(one, "handle_google_callback", callback)
+
+    async def flow():
+        request = Request(
+            {"type": "http", "method": "GET", "path": "/", "headers": [], "query_string": b"code=google&state=state"}
+        )
+        page = await mcp_server.google_callback(request)
+        markup = page.body.decode()
+        assert page.status_code == 200
+        assert "Connect client" in markup and "&lt;untrusted client&gt;" in markup
+        assert "approved-code" not in markup
+        approval = re.search(r'name="consent" value="([A-Za-z0-9_-]+)"', markup).group(1)
+
+        async def post():
+            body = urlencode({"consent": approval, "decision": "allow"}).encode()
+
+            async def receive():
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/",
+                    "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+                },
+                receive,
+            )
+            return await mcp_server.approve_client(request)
+
+        response = await post()
+        assert response.status_code == 302
+        assert response.headers["location"] == "http://localhost:1234/callback?code=approved-code&state=client-state"
+        assert (await post()).status_code == 400
+
+    asyncio.run(flow())
+
+
+def test_session_renewal_mints_cookie_and_logout_revokes_family():
+    from models import WebSession
+
+    one = SessionStore()
+    ttl = 30 * 86400
+    one.save("old-web-cookie", "alice@example.test", time.time() + ttl - 2 * 86400)
+    renewed = one.renew("old-web-cookie", ttl)
+    assert renewed["cookie"] and renewed["cookie"] != "old-web-cookie"
+    assert one.get(renewed["cookie"])["user_id"] == one.get("old-web-cookie")["user_id"]
+    with transaction() as db:
+        assert db.get(WebSession, digest("old-web-cookie")).expires_at < time.time() + 61
+    assert one.renew(renewed["cookie"], ttl)["cookie"] is None
+    one.delete(renewed["cookie"])
+    assert one.get("old-web-cookie") is None
+    assert one.get(renewed["cookie"]) is None

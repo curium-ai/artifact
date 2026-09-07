@@ -100,7 +100,8 @@ retries return the same revision while the grant is valid. Replacements use an o
 revision check: if the artifact changed since preparation, the server returns 409 and a
 new grant is required. Interrupted uploads can be retried from the beginning; byte-range
 resume is not implemented. `edit_file` remains available for exact text replacements and
-also creates a revision. Refresh the MCP client's tool list after upgrading.
+also creates a revision. Refresh the MCP client's tool list after upgrading. New authorization flows show an Artifact
+client-approval page; routine token refresh does not require another Google login or consent.
 
 ### Reviews
 

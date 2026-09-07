@@ -1,5 +1,4 @@
 import os
-import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -237,17 +236,12 @@ def logout(response: Response, artifact_session: str | None = Cookie(None)):
 
 @app.get("/api/auth/status")
 def auth_status(response: Response, artifact_session: str | None = Cookie(None)):
-    # Slide the session forward on every app open so active users stay logged
-    # in. The frontend calls this on mount, so opening artifact renews both the
-    # server-side row and the browser cookie for another full TTL.
-    if artifact_session and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", artifact_session):
-        artifact_session = None
-    session = session_store.touch(artifact_session, time.time() + SESSION_TTL) if artifact_session else None
+    session = session_store.renew(artifact_session, SESSION_TTL) if artifact_session else None
     authenticated = session is not None
-    if authenticated:
+    if session and session["cookie"]:
         response.set_cookie(
             key="artifact_session",
-            value=artifact_session,
+            value=session["cookie"],
             httponly=True,
             secure=COOKIE_SECURE,
             samesite="lax",
@@ -300,9 +294,12 @@ def list_files(path: str = "/", artifact_session: str | None = Cookie(None)):
     require_auth(artifact_session)
     base = os.path.realpath(UPLOAD_DIR)
     candidate = os.path.realpath(resolve_path(path))
-    if candidate != base and not candidate.startswith(base + os.sep):
-        raise HTTPException(400, "Invalid path")
-    resolved = Path(candidate)
+    if candidate == base:
+        resolved = UPLOAD_DIR
+    else:
+        if not candidate.startswith(base + os.sep):
+            raise HTTPException(400, "Invalid path")
+        resolved = Path(candidate)
     if not resolved.exists():
         return {"folders": [], "files": []}
     if not resolved.is_dir():

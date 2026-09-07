@@ -1,10 +1,11 @@
 import hashlib
 import html
 import os
+import secrets
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from artifacts import artifact_for_path, object_path, publish, relocate, remove, resolve, sync_alias
 from database import lock_writes, transaction
@@ -103,14 +104,56 @@ async def google_callback(request: Request):
             f"<h1>Authentication error</h1><p>{html.escape(str(e))}</p>", status_code=400
         )
 
-    params = {"code": mcp_code}
-    if mcp_state:
-        params["state"] = mcp_state
-    separator = "&" if "?" in redirect_uri else "?"
-    return RedirectResponse(
-        url=f"{redirect_uri}{separator}{urlencode(params)}",
-        status_code=302,
+    data = auth_provider._store.flow(mcp_code)
+    client = await auth_provider.get_client(data["authorization"]["client_id"])
+    consent = secrets.token_urlsafe(32)
+    auth_provider._store.save_flow(consent, {"code": mcp_code, "redirect_uri": redirect_uri, "state": mcp_state},
+                                  time.time() + 300)
+    name = html.escape(client.client_name or "MCP client")
+    destination = html.escape(urlparse(redirect_uri).netloc or redirect_uri)
+    email = html.escape(data["email"])
+    # Client approval is explicit even when Google already remembers this browser.
+    return HTMLResponse(
+        f"""<!doctype html><html><head><title>Connect to Artifact</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <style>body{{font:16px system-ui;background:#f3efea;color:#151515;padding:40px}}
+        main{{max-width:480px;margin:8vh auto;padding:32px;background:white;border-radius:12px}}
+        p{{line-height:1.6}}button{{padding:12px 18px;margin:8px 8px 0 0;cursor:pointer}}</style></head>
+        <body><main><h1>Connect {name}?</h1><p>Signed in as {email}.</p>
+        <p>This client can read, upload, edit, move, and delete files in this Artifact workspace.</p>
+        <p>Authorization will return to <strong>{destination}</strong>.</p>
+        <form method="post" action="/mcp/consent">
+        <input type="hidden" name="consent" value="{consent}">
+        <button name="decision" value="allow">Connect client</button>
+        <button name="decision" value="deny">Cancel</button></form></main></body></html>""",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                 "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"},
     )
+
+
+@mcp.custom_route("/consent", methods=["POST"])
+async def approve_client(request: Request):
+    if not auth_provider:
+        return HTMLResponse("OAuth not configured", status_code=404)
+    async with request.form(max_fields=2, max_files=0) as form:
+        token, decision = form.get("consent"), form.get("decision")
+    if not isinstance(token, str) or decision not in ("allow", "deny"):
+        return HTMLResponse("Invalid approval", status_code=400)
+    data = auth_provider._store.flow(token, consume=True)
+    if not data or "code" not in data:
+        return HTMLResponse("Approval expired. Reconnect your client.", status_code=400)
+    if decision == "deny":
+        auth_provider._store.flow(data["code"], consume=True)
+        return HTMLResponse("Connection canceled. You can close this window.")
+    if not auth_provider._store.flow(data["code"]):
+        return HTMLResponse("Authorization expired. Reconnect your client.", status_code=400)
+    params = {"code": data["code"]}
+    if data["state"]:
+        params["state"] = data["state"]
+    uri = data["redirect_uri"]
+    separator = "&" if "?" in uri else "?"
+    return RedirectResponse(uri + separator + urlencode(params), status_code=302,
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
 # ---------------------------------------------------------------------------
