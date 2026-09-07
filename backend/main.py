@@ -1,23 +1,30 @@
 import os
-import shutil
 import secrets
-import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 
+from artifacts import artifact_for_path, object_path, relocate, remove, resolve
+from collaboration_api import router as collaboration_router
+from database import engine
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Cookie, Response, Request, Query
-from fastapi.responses import HTMLResponse
+from fastapi import Cookie, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse
+from settings import COOKIE_SECURE, MAX_FILE_BYTES
+from sqlalchemy import text
+from stores import SessionStore
+from uploads import browser_upload
+from uploads import router as upload_router
 
 load_dotenv()
 
 app = FastAPI(title="Artifact")
+app.include_router(upload_router)
+app.include_router(collaboration_router)
 
 UPLOAD_DIR = Path(os.environ.get("ARTIFACT_UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "uploads")))
 PASSWORD = os.environ.get("ARTIFACT_PASSWORD", "artifact")
-MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_FILE_SIZE = MAX_FILE_BYTES
 FRONTEND_DIR = Path(os.environ.get("ARTIFACT_FRONTEND_DIR", os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")))
 
 AUTH_MODE = os.environ.get("ARTIFACT_AUTH_MODE", "password")
@@ -27,101 +34,29 @@ ALLOWED_DOMAIN = os.environ.get("ARTIFACT_ALLOWED_DOMAIN", "")
 SESSION_TTL = 30 * 86400  # 30 days; slides forward on each visit (see auth_status)
 
 
-class SessionStore:
-    """SQLite-backed store for web login sessions.
-
-    Sessions must survive process restarts (Render restarts dynos freely).
-    Shares the dotfile db on the upload disk with the MCP token store so it
-    stays hidden from file listings.
-    """
-
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        with self._connect() as db:
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS web_sessions (
-                    token TEXT PRIMARY KEY,
-                    email TEXT,
-                    expires_at REAL NOT NULL
-                )
-                """
-            )
-
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
-
-    def get(self, token: str) -> Optional[dict]:
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT email, expires_at FROM web_sessions WHERE token = ?",
-                (token,),
-            ).fetchone()
-            if not row:
-                return None
-            email, expires_at = row
-            if time.time() > expires_at:
-                db.execute("DELETE FROM web_sessions WHERE token = ?", (token,))
-                return None
-        return {"email": email, "expiry": expires_at}
-
-    def save(self, token: str, email: Optional[str], expires_at: float) -> None:
-        with self._connect() as db:
-            db.execute(
-                "INSERT OR REPLACE INTO web_sessions (token, email, expires_at) VALUES (?, ?, ?)",
-                (token, email, expires_at),
-            )
-            db.execute(
-                "DELETE FROM web_sessions WHERE expires_at < ?", (time.time(),)
-            )
-
-    def touch(self, token: str, new_expires_at: float) -> Optional[dict]:
-        """Slide a live session's expiry forward. Returns the session, or None
-        if the token is unknown/expired (so active users never get logged out)."""
-        session = self.get(token)
-        if session is None:
-            return None
-        self.save(token, session["email"], new_expires_at)
-        return session
-
-    def delete(self, token: str) -> None:
-        with self._connect() as db:
-            db.execute("DELETE FROM web_sessions WHERE token = ?", (token,))
-
-
-# Same dotfile db as the MCP token store (see mcp_server.py) so both hide
-# behind one dot-prefixed file on the persistent upload disk.
-SESSION_DB = os.environ.get("ARTIFACT_MCP_AUTH_DB", str(UPLOAD_DIR / ".mcp_auth.db"))
-session_store = SessionStore(SESSION_DB)
+session_store = SessionStore()
 
 MCP_TOKEN = os.environ.get("ARTIFACT_MCP_TOKEN", "")
 
 
 def resolve_path(user_path: str) -> Path:
-    # realpath + startswith rather than Path.is_relative_to: same containment
-    # semantics, but a form CodeQL recognizes as a path-injection sanitizer.
-    base = os.path.realpath(UPLOAD_DIR)
-    candidate = os.path.realpath(os.path.join(base, user_path.strip("/")))
-    if candidate != base and not candidate.startswith(base + os.sep):
-        raise HTTPException(status_code=400, detail="Invalid path")
-    return Path(candidate)
+    return resolve(user_path)
 
 
-def is_authenticated(session_token: Optional[str]) -> bool:
+def is_authenticated(session_token: str | None) -> bool:
     if not session_token:
         return False
     return session_store.get(session_token) is not None
 
 
-def get_session_email(session_token: Optional[str]) -> Optional[str]:
+def get_session_email(session_token: str | None) -> str | None:
     if not session_token:
         return None
     session = session_store.get(session_token)
     return session.get("email") if session else None
 
 
-def require_auth(session_token: Optional[str]):
+def require_auth(session_token: str | None):
     if not is_authenticated(session_token):
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -129,8 +64,8 @@ def require_auth(session_token: Optional[str]):
 # Mount MCP server at /mcp
 _mcp_app = None
 try:
-    from starlette.routing import Route as _StarletteRoute
     from mcp_server import create_mcp_app
+    from starlette.routing import Route as _StarletteRoute
     _mcp_app = create_mcp_app()
 
     # RFC 8414/9728: well-known discovery endpoints must be reachable at the
@@ -175,48 +110,42 @@ try:
     # with a static bearer token (ARTIFACT_MCP_TOKEN) when configured.
     from mcp_server import auth_provider as _mcp_auth_provider
     if _mcp_auth_provider is None:
-        if MCP_TOKEN:
-            class _MCPBearerAuth:
-                def __init__(self, asgi_app):
-                    self.asgi_app = asgi_app
+        class _MCPBearerAuth:
+            def __init__(self, asgi_app):
+                self.asgi_app = asgi_app
 
-                async def __call__(self, scope, receive, send):
-                    path = scope.get("path", "")
-                    if scope.get("type") == "http" and (path == "/mcp" or path.startswith("/mcp/")):
-                        provided = dict(scope.get("headers") or []).get(b"authorization", b"")
-                        expected = f"Bearer {MCP_TOKEN}".encode()
-                        if not secrets.compare_digest(provided, expected):
-                            await send({
-                                "type": "http.response.start",
-                                "status": 401,
-                                "headers": [
-                                    (b"content-type", b"application/json"),
-                                    (b"www-authenticate", b"Bearer"),
-                                ],
-                            })
-                            await send({
-                                "type": "http.response.body",
-                                "body": b'{"detail": "Unauthorized"}',
-                            })
-                            return
-                    await self.asgi_app(scope, receive, send)
+            async def __call__(self, scope, receive, send):
+                path = scope.get("path", "")
+                if scope.get("type") == "http" and (path == "/mcp" or path.startswith("/mcp/")):
+                    provided = dict(scope.get("headers") or []).get(b"authorization", b"")
+                    expected = f"Bearer {MCP_TOKEN}".encode()
+                    if not MCP_TOKEN or not secrets.compare_digest(provided, expected):
+                        await send({
+                            "type": "http.response.start",
+                            "status": 401,
+                            "headers": [
+                                (b"content-type", b"application/json"),
+                                (b"www-authenticate", b"Bearer"),
+                            ],
+                        })
+                        await send({
+                            "type": "http.response.body",
+                            "body": b'{"detail": "Unauthorized"}',
+                        })
+                        return
+                await self.asgi_app(scope, receive, send)
 
-            app.add_middleware(_MCPBearerAuth)
-        else:
-            import sys
-            print(
-                "WARNING: /mcp is UNAUTHENTICATED — anyone who can reach this host has "
-                "full file access. Set ARTIFACT_MCP_TOKEN or configure Google OAuth.",
-                file=sys.stderr,
-            )
+        app.add_middleware(_MCPBearerAuth)
+
 except Exception as e:
-    import sys
-    print(f"Warning: MCP server not mounted: {e}", file=sys.stderr)
+    raise RuntimeError("MCP server could not be initialized") from e
 
 
 @asynccontextmanager
 async def _lifespan(_app):
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    with engine.connect() as connection:
+        connection.execute(text("SELECT version_num FROM alembic_version"))
     if AUTH_MODE == "google":
         if not GOOGLE_CLIENT_ID:
             raise RuntimeError("GOOGLE_CLIENT_ID is required when ARTIFACT_AUTH_MODE=google")
@@ -246,6 +175,7 @@ async def login(request: Request, response: Response):
         key="artifact_session",
         value=token,
         httponly=True,
+        secure=COOKIE_SECURE,
         samesite="lax",
         max_age=SESSION_TTL,
     )
@@ -262,8 +192,8 @@ async def google_login(request: Request, response: Response):
     if not credential:
         raise HTTPException(status_code=400, detail="Missing credential")
 
-    from google.oauth2 import id_token
     from google.auth.transport import requests as google_requests
+    from google.oauth2 import id_token
 
     try:
         idinfo = id_token.verify_oauth2_token(
@@ -273,7 +203,7 @@ async def google_login(request: Request, response: Response):
         raise HTTPException(status_code=401, detail="Invalid token")
 
     email = idinfo.get("email", "")
-    if not email:
+    if not email or not idinfo.get("email_verified"):
         raise HTTPException(status_code=401, detail="No email in token")
 
     domain = email.split("@")[-1].lower()
@@ -284,11 +214,12 @@ async def google_login(request: Request, response: Response):
         )
 
     token = secrets.token_urlsafe(32)
-    session_store.save(token, email, time.time() + SESSION_TTL)
+    session_store.save(token, email, time.time() + SESSION_TTL, idinfo.get("sub"), idinfo.get("name"))
     response.set_cookie(
         key="artifact_session",
         value=token,
         httponly=True,
+        secure=COOKIE_SECURE,
         samesite="lax",
         max_age=SESSION_TTL,
     )
@@ -296,7 +227,7 @@ async def google_login(request: Request, response: Response):
 
 
 @app.post("/api/auth/logout")
-def logout(response: Response, artifact_session: Optional[str] = Cookie(None)):
+def logout(response: Response, artifact_session: str | None = Cookie(None)):
     if artifact_session:
         session_store.delete(artifact_session)
     response.delete_cookie("artifact_session")
@@ -304,29 +235,29 @@ def logout(response: Response, artifact_session: Optional[str] = Cookie(None)):
 
 
 @app.get("/api/auth/status")
-def auth_status(response: Response, artifact_session: Optional[str] = Cookie(None)):
-    # Slide the session forward on every app open so active users stay logged
-    # in. The frontend calls this on mount, so opening artifact renews both the
-    # server-side row and the browser cookie for another full TTL.
-    session = session_store.touch(artifact_session, time.time() + SESSION_TTL) if artifact_session else None
+def auth_status(response: Response, artifact_session: str | None = Cookie(None)):
+    session = session_store.renew(artifact_session, SESSION_TTL) if artifact_session else None
     authenticated = session is not None
-    if authenticated:
+    if session and session["cookie"]:
         response.set_cookie(
             key="artifact_session",
-            value=artifact_session,
+            value=session["cookie"],
             httponly=True,
+            secure=COOKIE_SECURE,
             samesite="lax",
             max_age=SESSION_TTL,
         )
     result: dict = {
         "authenticated": authenticated,
         "authMode": AUTH_MODE,
+        "maxFileBytes": MAX_FILE_BYTES,
     }
     if AUTH_MODE == "google":
         result["googleClientId"] = GOOGLE_CLIENT_ID
         result["allowedDomain"] = ALLOWED_DOMAIN
     if authenticated:
         result["email"] = session["email"]
+        result["userId"] = session["user_id"]
     return result
 
 
@@ -359,9 +290,16 @@ def format_size(size_bytes: int) -> str:
 
 
 @app.get("/api/files")
-def list_files(path: str = "/", artifact_session: Optional[str] = Cookie(None)):
+def list_files(path: str = "/", artifact_session: str | None = Cookie(None)):
     require_auth(artifact_session)
-    resolved = resolve_path(path)
+    base = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(resolve_path(path))
+    if candidate == base:
+        resolved = UPLOAD_DIR
+    else:
+        if not candidate.startswith(base + os.sep):
+            raise HTTPException(400, "Invalid path")
+        resolved = Path(candidate)
     if not resolved.exists():
         return {"folders": [], "files": []}
     if not resolved.is_dir():
@@ -387,7 +325,7 @@ def list_files(path: str = "/", artifact_session: Optional[str] = Cookie(None)):
 
 
 @app.get("/api/tree")
-def get_tree(artifact_session: Optional[str] = Cookie(None)):
+def get_tree(artifact_session: str | None = Cookie(None)):
     require_auth(artifact_session)
     def walk(dir_path: Path, rel: str) -> list:
         result = []
@@ -409,33 +347,16 @@ def get_tree(artifact_session: Optional[str] = Cookie(None)):
 async def upload_files(
     request: Request,
     path: str = Query("/"),
-    artifact_session: Optional[str] = Cookie(None),
+    artifact_session: str | None = Cookie(None),
 ):
     require_auth(artifact_session)
-    resolved = resolve_path(path)
-    resolved.mkdir(parents=True, exist_ok=True)
-
-    form = await request.form()
-    uploaded = []
-    for key, upload in form.multi_items():
-        if not hasattr(upload, "filename") or not upload.filename:
-            continue
-        if not upload.filename.endswith(".html"):
-            continue
-        content = await upload.read()
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail=f"File {upload.filename} exceeds 10MB limit")
-        file_path = resolved / upload.filename
-        file_path.write_bytes(content)
-        uploaded.append(upload.filename)
-
-    return {"uploaded": uploaded, "count": len(uploaded)}
+    return await browser_upload(request, path, session_store.get(artifact_session)["user_id"])
 
 
 @app.post("/api/folders")
 async def create_folder(
     request: Request,
-    artifact_session: Optional[str] = Cookie(None),
+    artifact_session: str | None = Cookie(None),
 ):
     require_auth(artifact_session)
     body = await request.json()
@@ -454,7 +375,7 @@ async def create_folder(
 @app.post("/api/files/rename")
 async def rename_item(
     request: Request,
-    artifact_session: Optional[str] = Cookie(None),
+    artifact_session: str | None = Cookie(None),
 ):
     require_auth(artifact_session)
     body = await request.json()
@@ -463,21 +384,16 @@ async def rename_item(
     new_name = body.get("newName", "").strip()
     if not old_name or not new_name or "/" in new_name:
         raise HTTPException(status_code=400, detail="Invalid names")
-    resolved = resolve_path(path)
-    old_path = resolved / old_name
-    new_path = resolved / new_name
-    if not old_path.exists():
-        raise HTTPException(status_code=404, detail="Item not found")
-    if new_path.exists():
-        raise HTTPException(status_code=409, detail="Name already taken")
-    old_path.rename(new_path)
+    if "/" in old_name or "\\" in old_name:
+        raise HTTPException(400, "Invalid filename")
+    relocate(path.rstrip("/") + "/" + old_name, path.rstrip("/") + "/" + new_name)
     return {"ok": True}
 
 
 @app.post("/api/files/move")
 async def move_item(
     request: Request,
-    artifact_session: Optional[str] = Cookie(None),
+    artifact_session: str | None = Cookie(None),
 ):
     require_auth(artifact_session)
     body = await request.json()
@@ -486,64 +402,35 @@ async def move_item(
     to_path = body.get("toPath", "/")
     if not name:
         raise HTTPException(status_code=400, detail="No item specified")
-    source = resolve_path(from_path) / name
-    dest_dir = resolve_path(to_path)
-    dest = dest_dir / name
-    if not source.exists():
-        raise HTTPException(status_code=404, detail="Item not found")
-    if dest.exists():
-        raise HTTPException(status_code=409, detail="Item already exists at destination")
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source), str(dest))
+    if "/" in name or "\\" in name:
+        raise HTTPException(400, "Invalid filename")
+    relocate(from_path.rstrip("/") + "/" + name, to_path.rstrip("/") + "/" + name)
     return {"ok": True}
 
 
 @app.delete("/api/files")
 async def delete_item(
     request: Request,
-    artifact_session: Optional[str] = Cookie(None),
+    artifact_session: str | None = Cookie(None),
 ):
     require_auth(artifact_session)
     body = await request.json()
     path = body.get("path", "/")
     name = body.get("name", "")
-    item_type = body.get("type", "file")
-    resolved = resolve_path(path)
-    target = resolved / name
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="Item not found")
-    if item_type == "folder" and target.is_dir():
-        shutil.rmtree(target)
-    elif target.is_file():
-        target.unlink()
-    else:
-        raise HTTPException(status_code=400, detail="Type mismatch")
+    if not name or "/" in name or "\\" in name:
+        raise HTTPException(400, "Invalid filename")
+    remove(path.rstrip("/") + "/" + name)
     return {"ok": True}
 
 
 @app.get("/v/{file_path:path}")
-def serve_public(file_path: str, artifact_session: Optional[str] = Cookie(None)):
+def serve_public(file_path: str, artifact_session: str | None = Cookie(None)):
     if AUTH_MODE == "google" and not is_authenticated(artifact_session):
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/")
-    # Inline containment guard (same semantics as resolve_path): CodeQL's
-    # path-injection query doesn't carry the sanitizer across a call boundary,
-    # so guard the exact value that reaches read_text here.
-    base = os.path.realpath(UPLOAD_DIR)
-    candidate = os.path.realpath(os.path.join(base, file_path.strip("/")))
-    if not candidate.startswith(base + os.sep):
-        raise HTTPException(status_code=404, detail="File not found")
-    resolved = Path(candidate)
-    if not resolved.exists() or not resolved.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-    if resolved.suffix.lower() != ".html":
-        raise HTTPException(status_code=404, detail="File not found")
-    # CSP sandbox: shared docs run in an opaque origin so uploaded HTML cannot
-    # call the admin write APIs with the viewer's session cookie.
-    return HTMLResponse(
-        content=resolved.read_text(encoding="utf-8", errors="replace"),
-        headers={"Content-Security-Policy": "sandbox allow-scripts"},
-    )
+    artifact = artifact_for_path("/" + file_path)
+    return FileResponse(object_path(artifact.current_revision_id), media_type="text/html",
+                        headers={"Content-Security-Policy": "sandbox allow-scripts", "Cache-Control": "no-store"})
 
 
 # Serve frontend static files in production

@@ -1,125 +1,166 @@
 # Artifact
 
-A tiny self-hosted file sharing app for HTML prototypes. Upload `.html` files, organise them into folders, and share a clean public link — no accounts, no analytics, no third parties.
+Self-hosted HTML sharing and review. Upload a prototype, share a stable review link,
+comment on a section, and receive in-app reply notifications.
 
-Built as a lightweight alternative to dropping prototypes into Vercel/Netlify when all you want is a stable URL to send someone.
+## Stack and development
 
-## How it works
+FastAPI + FastMCP, PostgreSQL + SQLAlchemy/Alembic, React + TypeScript + Vite, and a
+persistent filesystem for HTML revisions. The Docker image builds and serves both apps.
 
-- **Admin side** (password-gated): browse, upload, rename, move, and delete HTML files in a folder tree. Folder and file views are bookmarkable (`/browse/<folder>?f=<file>.html`) and the browser back button works.
-- **Public side** (no auth): anyone with a link to `/v/<path>/<file>.html` can view the file. Folder listings and the admin UI stay private. Shared documents are served with a CSP sandbox so they can't act on the app with a viewer's session.
-- **MCP side**: Claude (or any MCP client) can manage documents at `/mcp` — including surgical edits (`edit_file`), chunked writes for large documents (`append_file`), and reading a document from its share link (`read_file_from_url`).
-
-## Stack
-
-- **Backend** — FastAPI (Python 3.12), session cookies in-memory, files on disk
-- **Frontend** — React + TypeScript + Vite
-- **Deploy** — single Docker image, multi-stage build
-
-## Run it
-
-### Docker (recommended)
-
-```bash
-ARTIFACT_PASSWORD=your-password docker compose up --build
+```sh
+ARTIFACT_PASSWORD=choose-a-password ARTIFACT_MCP_TOKEN=choose-a-token docker compose up --build
 ```
 
-App is at `http://localhost:3000`. Uploads persist to `./data`.
-
-### Local dev
-
-Backend:
-
-```bash
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
-```
-
-Frontend:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
+Open http://localhost:3000. For development without Docker, start PostgreSQL, set
+`DATABASE_URL`, install `backend/requirements.txt`, run `alembic -c backend/alembic.ini
+upgrade head`, and start `uvicorn main:app --app-dir backend --reload --port 8000`.
+Run `npm ci && npm run dev` in `frontend/`. Set `ARTIFACT_PUBLIC_URL` to the browser-facing
+origin; Vite proxies the app APIs and review links to the backend.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ARTIFACT_PASSWORD` | `artifact` | Admin login password |
-| `ARTIFACT_UPLOAD_DIR` | `backend/uploads` | Where uploaded files live |
-| `ARTIFACT_FRONTEND_DIR` | `frontend/dist` | Built frontend assets to serve |
-| `ARTIFACT_AUTH_MODE` | `password` | Auth mode: `password` or `google` |
-| `GOOGLE_CLIENT_ID` | — | Google OAuth 2.0 Client ID (required when mode=`google`) |
-| `ARTIFACT_ALLOWED_DOMAIN` | — | Allowed email domain, e.g. `mycompany.com` (required when mode=`google`) |
-| `ARTIFACT_MCP_TOKEN` | — | Bearer token protecting `/mcp` in password mode. **Set this** — without it (and without Google OAuth) the MCP endpoint is open to anyone who can reach the host |
+| `DATABASE_URL` | required | PostgreSQL connection URL |
+| `ARTIFACT_PUBLIC_URL` | `http://localhost:8000` | Externally reachable origin |
+| `ARTIFACT_UPLOAD_DIR` | `backend/uploads` | Persistent files and revision objects |
+| `ARTIFACT_FRONTEND_DIR` | `frontend/dist` | Built frontend |
+| `ARTIFACT_MAX_FILE_BYTES` | `104857600` | 100 MiB per file |
+| `ARTIFACT_AUTH_MODE` | `password` | `password` or `google` |
+| `ARTIFACT_PASSWORD` | `artifact` | Shared admin password; change before deployment |
+| `GOOGLE_CLIENT_ID` | empty | Google web OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | empty | Required for MCP Google authorization |
+| `ARTIFACT_ALLOWED_DOMAIN` | empty | Required Google email domain in Google mode |
+| `ARTIFACT_MCP_TOKEN` | empty | Bearer token in password mode; MCP denies access when absent |
+| `ARTIFACT_MCP_BASE_URL` | public origin + `/mcp` | MCP OAuth resource URL |
 
-Uploads are capped at 10MB per file and restricted to `.html`.
+For Google login, register your public origin as an authorized JavaScript origin and
+`<public-origin>/mcp/google/callback` as an authorized redirect URI in Google Cloud.
+Configure the client ID, secret, domain, and `ARTIFACT_AUTH_MODE=google` on the server.
+In Google mode both raw file links and review links require sign-in. Password mode keeps
+legacy raw `/v/` links public while review/comment APIs require login.
 
-### MCP (Claude integration)
+## Validation
 
-The MCP endpoint lives at `/mcp` (streamable HTTP). In password mode, set `ARTIFACT_MCP_TOKEN` and configure your MCP client with an `Authorization: Bearer <token>` header. With Google OAuth configured, `/mcp` uses OAuth instead.
-
-Tools: `list_files`, `get_file_tree`, `read_file`, `read_file_from_url` (reads a `/v/...` share link), `create_file`, `update_file`, `edit_file` (exact string replacement — no need to resend the whole document), `append_file` (build large documents in chunks), `delete_file`, `create_folder`, `delete_folder`, `rename`, `move`.
-
-### Google Sign-In (domain-restricted access)
-
-To lock the entire app behind Google Sign-In so only users with a specific email domain can access it:
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/apis/credentials) and create an **OAuth 2.0 Client ID** (type: Web application). Add your deployment URL (e.g. `http://localhost:3000`) to **Authorized JavaScript origins**.
-2. Set the environment variables:
-
-```bash
-ARTIFACT_AUTH_MODE=google \
-GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com \
-ARTIFACT_ALLOWED_DOMAIN=mycompany.com \
-docker compose up --build
-```
-
-When enabled, all routes — including file browsing and public `/v/` links — require authentication. Only `@mycompany.com` Google accounts can sign in. Password login is disabled.
-
-## API
-
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| `POST` | `/api/auth/login` | — | Exchange password for a session cookie |
-| `POST` | `/api/auth/logout` | — | Clear session |
-| `GET` | `/api/auth/status` | — | Check session |
-| `POST` | `/api/auth/google` | — | Exchange Google ID token for session (google mode) |
-| `GET` | `/api/files?path=/x` | ✓ | List folder contents |
-| `GET` | `/api/tree` | ✓ | Full folder tree |
-| `POST` | `/api/files/upload` | ✓ | Upload `.html` files |
-| `POST` | `/api/folders` | ✓ | Create folder |
-| `POST` | `/api/files/rename` | ✓ | Rename file or folder |
-| `POST` | `/api/files/move` | ✓ | Move file or folder |
-| `DELETE` | `/api/files` | ✓ | Delete file or folder |
-| `GET` | `/v/<path>` | google | Public render of an HTML file |
-
-## Layout
-
-```
-backend/        FastAPI app (single file)
-frontend/       React + Vite UI
-project/        Original HTML/JSX design prototypes (kept for reference)
-chats/          Design handoff transcripts
-Dockerfile      Multi-stage build
-docker-compose.yml
-```
-
-## Tests & CI
-
-```bash
+```sh
 pip install -r backend/requirements.txt -r backend/requirements-dev.txt
 pytest backend/tests
 ruff check backend
+npm ci --prefix frontend
+npm run build --prefix frontend
 ```
 
-GitHub Actions runs the backend tests + ruff and the frontend type-check/build on every push and PR (`.github/workflows/ci.yml`).
+Unit tests use an isolated SQLite database by default. Set `ARTIFACT_TEST_DATABASE_URL` to
+a **disposable** Postgres database for integration/concurrency tests; the test suite clears
+its tables. CI runs both variants. Never point this variable at an existing deployment.
 
-## Notes
+## Collaboration and direct uploads
 
-- Session tokens are in-memory — restarting the server logs everyone out.
-- Path traversal is blocked at the API layer (`resolve_path`) and the static-file catch-all.
-- Shared `/v/` documents are served with `Content-Security-Policy: sandbox allow-scripts`: scripts run, but in an opaque origin (no cookies, no `localStorage`, no same-origin API calls). Remove that header in `backend/main.py` if a document legitimately needs those.
+Artifact supports one shared workspace per deployment. Google users from the configured
+`ARTIFACT_ALLOWED_DOMAIN` share access to its files. Password mode retains a shared
+administrator identity; use Google mode for individually attributed comments. There are
+no vendor-specific domains, infrastructure IDs, or credentials in the application.
+Hosting unrelated customer workspaces in one deployment requires an additional tenant
+isolation layer; the current release does not claim multi-tenant isolation.
+
+PostgreSQL now stores users, browser sessions, MCP clients and credentials, artifact IDs,
+immutable revision metadata, upload grants, anchored comment threads, replies, and in-app
+notifications. HTML revisions remain on the deployment's persistent disk. Back up both
+Postgres and the disk together. Provision disk capacity for retained revisions and temporary
+uploads; old revisions are deliberately retained so comments keep their context.
+
+Set `DATABASE_URL` to a PostgreSQL URL and `ARTIFACT_PUBLIC_URL` to this deployment's public
+origin. `ARTIFACT_MCP_BASE_URL` defaults to that origin plus `/mcp`. For HTTPS deployments,
+browser cookies use `Secure`. `ARTIFACT_MAX_FILE_BYTES` defaults to `104857600` (100 MiB),
+and the UI reads the limit from the server. Reverse proxies must also permit that request
+size and enough time for the client's transfer. Configure a real password or Google login
+and an MCP bearer token before exposing a deployment; MCP rejects unauthenticated requests
+when neither OAuth nor a bearer token is configured.
+
+`docker compose up --build` starts a local Postgres instance and a migration job before the
+application. The included database credentials are local development defaults. If changing
+`POSTGRES_PASSWORD`, also set the corresponding `DATABASE_URL`.
+
+### MCP upload contract
+
+The content-based `create_file`, `update_file`, and `append_file` tools have been removed.
+Write the HTML locally and compute its byte length and lowercase SHA-256. Call
+`prepare_upload(path, size, sha256, intent)` with a full destination path; `intent` is
+`create` or `replace`. Send the file directly to the returned URL:
+
+```sh
+curl --fail-with-body --upload-file ./report.html "$UPLOAD_URL"
+```
+
+The URL authorizes only the prepared destination, size, checksum, and user for 30 minutes.
+Treat it as a credential and redact `/api/uploads/*` paths in proxy/access logs. The response
+contains `artifactId`, `revisionId`, `reviewUrl`, `url`, and the verified checksum. Successful
+retries return the same revision while the grant is valid. Replacements use an optimistic
+revision check: if the artifact changed since preparation, the server returns 409 and a
+new grant is required. Interrupted uploads can be retried from the beginning; byte-range
+resume is not implemented. `edit_file` remains available for exact text replacements and
+also creates a revision. Refresh the MCP client's tool list after upgrading. New authorization flows show an Artifact
+client-approval page; routine token refresh does not require another Google login or consent.
+
+### Reviews
+
+Use `/a/<artifact-id>` for stable review links; existing `/v/<path>` links still render the
+original file. In the reviewer, enable comment mode, select an element, optionally select
+its containing element, and post a thread. Reply, resolve, reopen, or explicitly reattach
+an outdated anchor. Only the thread author or artifact owner can resolve or reattach it.
+
+Review rendering adds a selection bridge without modifying stored HTML. The document stays
+in its opaque-origin sandbox, and the parent app owns authentication and comment writes.
+Anchors store the revision, selector, element/stable IDs, tag, and text fingerprint. Across
+revisions, automatic matching requires an unambiguous ID and matching text; ambiguous anchors
+are marked as needing reattachment. Use stable `data-artifact-id` attributes in generated
+HTML for better matching. Canvas internals and nested third-party frames are outside the
+initial element-selection scope.
+
+Owners and other thread participants receive in-app notifications for new comments/replies;
+the actor is excluded. Notifications and comments commit together. The app polls every
+15 seconds while visible. Email, push, external invitations, and a CLI are outside this release.
+
+### Migrations and upgrade from SQLite
+
+From `backend/`, with `DATABASE_URL` configured:
+
+```sh
+alembic upgrade head
+alembic check
+alembic revision --autogenerate -m "Describe schema change"
+```
+
+Review generated revisions, keep one head, and inspect offline SQL before deployment.
+CI exercises upgrades, downgrade/re-upgrade, schema drift, and integration tests on Postgres.
+Migrations use per-revision transactions, a 30-second lock timeout, and a 20-minute statement
+timeout. Use additive migrations for rolling upgrades; do not drop a column still used by
+the outgoing application. For existing populated tables, review index/constraint lock costs
+and use concurrent indexes or staged validation when needed.
+
+For an existing installation, schedule a maintenance window and stop writes. Take a
+consistent SQLite backup with SQLite's backup API, plus a snapshot of the HTML disk.
+Provision Postgres, apply the schema, and run the importer where that disk is mounted:
+
+```sh
+python import_legacy.py --source /path/to/auth-backup.db
+python import_legacy.py --source /path/to/auth-backup.db --apply
+```
+
+The first command only reports counts. The importer reads its SQLite source in read-only
+mode, skips expired sessions/access tokens, preserves OAuth registrations, hashes stored
+bearer/session token keys, and backfills file IDs and initial revisions. It is rerunnable
+and does not overwrite existing imported credentials. Historical file ownership remains
+unknown until a named user replaces a file. Imports are separate from schema migrations
+because deployment build/pre-deploy environments may not have access to the file disk.
+
+Verify counts, representative files, web sessions, and MCP reconnect/refresh before routing
+traffic to the new application. Preserve the previous image and both backups for rollback;
+once new collaboration writes begin, reverting requires a data reconciliation plan. Existing
+MCP clients with already-invalid registration credentials may require reconnecting; the new
+server cannot reconstruct a lost client secret from the client.
+
+Run `python maintenance.py` to preview reconciliation and orphan cleanup, or add `--apply`
+to repair disk aliases, remove expired auth/upload rows, and delete abandoned temporary or
+unreferenced object files older than two hours. Referenced revisions are never removed.

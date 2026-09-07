@@ -10,3 +10,6 @@ __pycache__/
 
 # build info
 *.tsbuildinfo
+.venv/
+.pytest_cache/
+.ruff_cache/
