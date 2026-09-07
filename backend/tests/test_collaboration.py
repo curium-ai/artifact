@@ -241,3 +241,30 @@ def test_exact_100_mib_upload(client):
     assert response.status_code == 200
     assert response.json()["bytes"] == 104857600
     assert object_path(response.json()["revisionId"]).stat().st_size == 104857600
+
+
+def test_interrupted_upload_discards_staging(client, upload_dir):
+    import asyncio
+
+    from starlette.requests import ClientDisconnect, Request
+    from uploads import upload as receive_upload
+
+    author = user(client)
+    grant = prepare(
+        UploadRequest(path="/interrupted.html", size=6, sha256=hashlib.sha256(b"abcdef").hexdigest()), author
+    )
+    calls = 0
+
+    async def receive():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"type": "http.request", "body": b"abc", "more_body": True}
+        return {"type": "http.disconnect"}
+
+    request = Request({"type": "http", "method": "PUT", "path": "/", "headers": []}, receive)
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(receive_upload(grant["uploadUrl"].split("/")[-1], request))
+    assert not (upload_dir / "interrupted.html").exists()
+    assert not list((upload_dir / ".staging").iterdir())
+    assert client.put(grant["uploadUrl"], content=b"abcdef").status_code == 200

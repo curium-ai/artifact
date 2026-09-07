@@ -33,7 +33,11 @@ def object_path(revision_id):
 
 
 def hash_file(path):
-    with open(path, "rb") as stream:
+    base = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(path)
+    if not candidate.startswith(base + os.sep):
+        raise HTTPException(400, "Invalid file path")
+    with open(candidate, "rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
@@ -42,7 +46,11 @@ def ensure_artifact(db, path):
     artifact = db.scalar(select(Artifact).where(Artifact.path == path, Artifact.deleted.is_(False)))
     if artifact:
         return artifact
-    file = resolve(path)
+    base = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(resolve(path))
+    if not candidate.startswith(base + os.sep):
+        raise HTTPException(400, "Invalid file path")
+    file = Path(candidate)
     if not file.is_file() or file.suffix != ".html":
         return None
     if artifact is None:
@@ -133,7 +141,14 @@ def sync_alias(result):
 
 
 def relocate(source_path, destination_path):
-    source, destination = resolve(source_path), resolve(destination_path)
+    base = os.path.realpath(UPLOAD_DIR)
+    source_candidate = os.path.realpath(resolve(source_path))
+    if not source_candidate.startswith(base + os.sep):
+        raise HTTPException(400, "Invalid source")
+    destination_candidate = os.path.realpath(resolve(destination_path))
+    if not destination_candidate.startswith(base + os.sep):
+        raise HTTPException(400, "Invalid destination")
+    source, destination = Path(source_candidate), Path(destination_candidate)
     with transaction() as db:
         lock_writes(db)
         if not source.exists():
@@ -157,9 +172,11 @@ def relocate(source_path, destination_path):
 
 
 def remove(path):
-    target = resolve(path)
-    if target == UPLOAD_DIR:
-        raise HTTPException(400, "Cannot delete root")
+    base = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(resolve(path))
+    if not candidate.startswith(base + os.sep):
+        raise HTTPException(400, "Cannot delete root or files outside storage")
+    target = Path(candidate)
     with transaction() as db:
         lock_writes(db)
         if not target.exists():

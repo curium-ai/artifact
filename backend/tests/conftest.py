@@ -20,7 +20,7 @@ os.environ["ARTIFACT_AUTH_MODE"] = "password"
 # assertions see only test files.
 os.environ["ARTIFACT_MCP_AUTH_DB"] = os.path.join(tempfile.mkdtemp(prefix="artifact-test-db-"), "auth.db")
 
-os.environ["DATABASE_URL"] = os.environ.get("ARTIFACT_TEST_DATABASE_URL", "sqlite:///" + tempfile.mktemp(suffix=".db"))
+os.environ["DATABASE_URL"] = os.environ.get("ARTIFACT_TEST_DATABASE_URL", "sqlite:///" + str(Path(tempfile.mkdtemp(prefix="artifact-test-sqlite-")) / "test.db"))
 os.environ["ARTIFACT_PUBLIC_URL"] = "http://testserver"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

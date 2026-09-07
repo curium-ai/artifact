@@ -1,6 +1,9 @@
+import os
 import re
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlencode
+from uuid import UUID
 
 from artifacts import artifact_for_path, object_path
 from database import transaction
@@ -8,6 +11,7 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException
 from fastapi.responses import RedirectResponse, StreamingResponse
 from models import Artifact, Comment, CommentThread, Notification, Revision, User
 from pydantic import BaseModel, Field
+from settings import UPLOAD_DIR
 from sqlalchemy import select
 from stores import SessionStore
 
@@ -79,9 +83,9 @@ def artifact_detail(artifact_id: str, user_id: Annotated[str, Depends(current_us
 
 
 @router.get("/a/{artifact_id}")
-def review_link(artifact_id: str):
+def review_link(artifact_id: UUID):
     # The SPA retains this identifier across login, then resolves it with auth.
-    return RedirectResponse(f"/browse?artifact={artifact_id}", status_code=302)
+    return RedirectResponse("/browse?" + urlencode({"artifact": str(artifact_id)}), status_code=302)
 
 
 @router.get("/api/artifacts/{artifact_id}/review/{revision_id}")
@@ -95,7 +99,11 @@ def review_html(artifact_id: str, revision_id: str, user_id: Annotated[str, Depe
 
     def body():
         # The bridge runs before document scripts and does not change stored HTML.
-        with open(object_path(revision_id), "rb") as stream:
+        base = os.path.realpath(UPLOAD_DIR / ".objects")
+        candidate = os.path.realpath(object_path(revision_id))
+        if not candidate.startswith(base + os.sep):
+            raise HTTPException(400, "Invalid revision path")
+        with open(candidate, "rb") as stream:
             first = stream.read(65536)
             doctype = re.match(rb"(?:\xef\xbb\xbf)?\s*<!doctype\s+html[^>]*>", first, flags=re.IGNORECASE)
             offset = doctype.end() if doctype else 0

@@ -1,4 +1,5 @@
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -239,6 +240,8 @@ def auth_status(response: Response, artifact_session: str | None = Cookie(None))
     # Slide the session forward on every app open so active users stay logged
     # in. The frontend calls this on mount, so opening artifact renews both the
     # server-side row and the browser cookie for another full TTL.
+    if artifact_session and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", artifact_session):
+        artifact_session = None
     session = session_store.touch(artifact_session, time.time() + SESSION_TTL) if artifact_session else None
     authenticated = session is not None
     if authenticated:
@@ -246,7 +249,7 @@ def auth_status(response: Response, artifact_session: str | None = Cookie(None))
             key="artifact_session",
             value=artifact_session,
             httponly=True,
-        secure=COOKIE_SECURE,
+            secure=COOKIE_SECURE,
             samesite="lax",
             max_age=SESSION_TTL,
         )
@@ -295,7 +298,11 @@ def format_size(size_bytes: int) -> str:
 @app.get("/api/files")
 def list_files(path: str = "/", artifact_session: str | None = Cookie(None)):
     require_auth(artifact_session)
-    resolved = resolve_path(path)
+    base = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(resolve_path(path))
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise HTTPException(400, "Invalid path")
+    resolved = Path(candidate)
     if not resolved.exists():
         return {"folders": [], "files": []}
     if not resolved.is_dir():
