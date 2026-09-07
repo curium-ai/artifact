@@ -32,6 +32,7 @@ export function NavLink({ href, onNavigate, children, ...rest }: NavLinkProps) {
 // BUTTON
 // ═══════════════════════════════════════
 interface ButtonProps {
+  'aria-pressed'?: boolean;
   type?: 'button' | 'submit' | 'reset';
   children?: ReactNode;
   variant?: 'secondary' | 'primary' | 'danger' | 'ghost';
@@ -43,7 +44,7 @@ interface ButtonProps {
   title?: string;
 }
 
-export function Button({ type = 'button', children, variant = 'secondary', size = 'medium', icon, onClick, disabled, className = '', title }: ButtonProps) {
+export function Button({ type = 'button', children, variant = 'secondary', size = 'medium', icon, onClick, disabled, className = '', title, 'aria-pressed': pressed }: ButtonProps) {
   return (
     <button
       type={type}
@@ -52,6 +53,7 @@ export function Button({ type = 'button', children, variant = 'secondary', size 
       disabled={disabled}
       title={title}
       aria-disabled={disabled}
+      aria-pressed={pressed}
     >
       {icon && <span className="btn__icon">{icon}</span>}
       {children && <span className="btn__content">{children}</span>}

@@ -1,11 +1,12 @@
 (() => {
   if (window.parent === window) return;
   const parentOrigin = new URL(document.referrer || location.href).origin;
-  let enabled = false, selected = null, overlay;
+  let enabled = false, locked = false, selected = null, hovered = null, located = null;
+  let host, root, outline, timer, scheduled = false, markers = [], activeThread = null;
   const send = data => parent.postMessage({ channel: 'artifact-review', ...data }, parentOrigin);
   const quote = value => CSS.escape(value);
   const text = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500);
-  const usable = el => el instanceof HTMLElement && !['HTML', 'BODY', 'SCRIPT', 'STYLE', 'LINK', 'META'].includes(el.tagName) && el !== overlay;
+  const usable = el => el instanceof HTMLElement && !['HTML', 'BODY', 'SCRIPT', 'STYLE', 'LINK', 'META'].includes(el.tagName) && el !== host && !host?.contains(el);
   function selector(el) {
     if (el.id && document.querySelectorAll('#' + quote(el.id)).length === 1) return '#' + quote(el.id);
     const parts = [];
@@ -18,16 +19,25 @@
   function anchor(el) {
     return { selector: selector(el), text: text(el), tag: el.tagName.toLowerCase(), elementId: el.id || '', stableId: el.getAttribute('data-artifact-id') || '' };
   }
-  function highlight(el) {
-    if (!overlay) {
-      overlay = document.createElement('div');
-      overlay.setAttribute('aria-hidden', 'true');
-      Object.assign(overlay.style, { position: 'fixed', pointerEvents: 'none', zIndex: '2147483647', border: '2px solid #f54e00', background: '#f54e0010', boxSizing: 'border-box' });
-      document.documentElement.appendChild(overlay);
-    }
-    if (!el) { overlay.style.display = 'none'; return; }
-    const r = el.getBoundingClientRect();
-    Object.assign(overlay.style, { display: 'block', left: r.x + 'px', top: r.y + 'px', width: r.width + 'px', height: r.height + 'px' });
+  function mount() {
+    if (host) return;
+    host = document.createElement('div');
+    // Keep annotations outside the author's DOM and CSS, including anchor text and nth-of-type selectors.
+    host.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;pointer-events:none!important;z-index:2147483647!important;';
+    document.documentElement.appendChild(host);
+    root = host.attachShadow({ mode: 'closed' });
+    const style = document.createElement('style');
+    style.textContent = `
+      .outline {position:fixed;pointer-events:none;box-sizing:border-box;border:1px solid #758c87;border-radius:3px;background:transparent;}
+      .outline.selecting {border:1.5px solid #28776a;background:#28776a08;}
+      button {all:initial;box-sizing:border-box;position:fixed;pointer-events:auto;display:flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50% 50% 50% 3px;border:1px solid #b7c9c4;background:#fff;color:#245b50;box-shadow:0 1px 5px #142e2720;font:600 12px/1 system-ui,sans-serif;cursor:pointer;}
+      button:hover,button.active {background:#245b50;color:#fff;border-color:#245b50;}
+      button:focus-visible {outline:2px solid #245b50;outline-offset:3px;}
+      button.resolved {color:#68736f;background:#f4f6f5;border-color:#ccd4d1;}
+      button[hidden],.outline[hidden] {display:none;}
+    `;
+    outline = document.createElement('div'); outline.className = 'outline'; outline.hidden = true; outline.setAttribute('aria-hidden', 'true');
+    root.append(style, outline);
   }
   function find(a, sameRevision) {
     if (!a || typeof a.selector !== 'string' || a.selector.length > 4096) return null;
@@ -40,28 +50,90 @@
       return usable(el) && el.tagName.toLowerCase() === a.tag && text(el) === a.text ? el : null;
     } catch { return null; }
   }
+  function bounds(el) {
+    if (!el?.isConnected || !el.getClientRects().length || getComputedStyle(el).visibility !== 'visible') return null;
+    const r = el.getBoundingClientRect();
+    let left = Math.max(0, r.left), top = Math.max(0, r.top), right = Math.min(innerWidth, r.right), bottom = Math.min(innerHeight, r.bottom);
+    // Markers follow nested scroll areas and never float above clipped content.
+    for (let node = el.parentElement; node && node !== document.documentElement; node = node.parentElement) {
+      const style = getComputedStyle(node), b = node.getBoundingClientRect();
+      if (/(auto|scroll|hidden|clip)/.test(style.overflowX)) { left = Math.max(left, b.left); right = Math.min(right, b.right); }
+      if (/(auto|scroll|hidden|clip)/.test(style.overflowY)) { top = Math.max(top, b.top); bottom = Math.min(bottom, b.bottom); }
+    }
+    return right > left && bottom > top ? { left, top, right, bottom, width: right - left, height: bottom - top } : null;
+  }
+  function draw() {
+    scheduled = false; mount();
+    const target = located || (enabled ? selected || hovered : null);
+    const r = bounds(target);
+    outline.hidden = !r;
+    outline.className = 'outline' + (enabled && !located ? ' selecting' : '');
+    if (r) Object.assign(outline.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+    const occupied = [];
+    for (const marker of markers) {
+      const b = bounds(marker.el);
+      const button = marker.button;
+      button.hidden = !b || !marker.visible;
+      button.className = (marker.id === activeThread ? 'active ' : '') + (marker.resolved ? 'resolved' : '');
+      if (!b || !marker.visible) continue;
+      let x = Math.max(4, Math.min(innerWidth - 30, b.right - 13)), y = Math.max(4, Math.min(innerHeight - 30, b.top - 13));
+      // Multiple threads on a section remain individually reachable.
+      while (occupied.some(p => Math.abs(p.x - x) < 28 && Math.abs(p.y - y) < 28) && x > 32) x -= 30;
+      while (occupied.some(p => Math.abs(p.x - x) < 28 && Math.abs(p.y - y) < 28) && y < innerHeight - 58) y += 30;
+      occupied.push({ x, y });
+      Object.assign(button.style, { left: x + 'px', top: y + 'px' });
+    }
+  }
+  function redraw() { if (!scheduled) { scheduled = true; requestAnimationFrame(draw); } }
+  function showLocation(el) {
+    clearTimeout(timer); located = el;
+    timer = setTimeout(() => { located = null; redraw(); }, 1800);
+    redraw();
+  }
   addEventListener('message', event => {
     if (event.source !== parent || event.origin !== parentOrigin || event.data?.channel !== 'artifact-review') return;
     const data = event.data;
-    if (data.type === 'mode') { enabled = data.enabled === true; if (!enabled) { selected = null; highlight(null); } }
-    if (data.type === 'parent' && selected && usable(selected.parentElement)) {
-      selected = selected.parentElement; highlight(selected); send({ type: 'selected', anchor: anchor(selected) });
+    if (data.type === 'mode') { enabled = data.enabled === true; locked = data.locked === true; hovered = null; located = null; redraw(); }
+    if (data.type === 'clear-selection') { selected = null; hovered = null; located = null; redraw(); }
+    if (data.type === 'parent' && !locked && selected && usable(selected.parentElement)) {
+      selected = selected.parentElement; redraw(); send({ type: 'selected', anchor: anchor(selected) });
     }
     if (data.type === 'focus') {
       const el = find(data.anchor, data.sameRevision === true);
       send({ type: 'located', threadId: data.threadId, found: !!el });
-      if (el) { selected = el; el.scrollIntoView({ block: 'center', behavior: 'smooth' }); highlight(el); }
+      if (el) { el.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); showLocation(el); }
     }
     if (data.type === 'check' && Array.isArray(data.threads)) {
-      send({ type: 'checked', missing: data.threads.filter(t => !find(t.anchor, t.sameRevision === true)).map(t => t.id) });
+      mount(); activeThread = data.activeThread;
+      const previous = new Map(markers.map(m => [m.id, m]));
+      markers = data.threads.map(t => {
+        const marker = previous.get(t.id) || { button: document.createElement('button') };
+        previous.delete(t.id);
+        Object.assign(marker, t, { el: find(t.anchor, t.sameRevision === true) });
+        marker.button.type = 'button'; marker.button.textContent = String(t.number);
+        marker.button.setAttribute('aria-label', 'Open comment ' + t.number + (t.resolved ? ' (resolved)' : ''));
+        marker.button.title = 'Comment ' + t.number;
+        marker.button.onclick = () => { activeThread = t.id; showLocation(marker.el); send({ type: 'open-thread', threadId: t.id }); };
+        if (!marker.button.isConnected) root.appendChild(marker.button);
+        return marker;
+      });
+      previous.forEach(m => m.button.remove());
+      send({ type: 'checked', missing: markers.filter(m => !m.el).map(m => m.id) }); redraw();
     }
   });
-  addEventListener('pointermove', event => { if (enabled && !selected && usable(event.target)) highlight(event.target); }, true);
+  addEventListener('pointermove', event => { if (enabled && !locked && !selected) { hovered = usable(event.target) ? event.target : null; redraw(); } }, true);
+  addEventListener('pointerout', event => { if (!event.relatedTarget) { hovered = null; redraw(); } }, true);
   addEventListener('click', event => {
     if (!enabled || !usable(event.target)) return;
-    event.preventDefault(); event.stopImmediatePropagation(); selected = event.target;
-    highlight(selected); send({ type: 'selected', anchor: anchor(selected) });
+    event.preventDefault(); event.stopImmediatePropagation();
+    if (locked) return;
+    selected = event.target; located = null; redraw(); send({ type: 'selected', anchor: anchor(selected) });
   }, true);
-  addEventListener('scroll', () => { if (selected) highlight(selected); }, true);
-  addEventListener('resize', () => { if (selected) highlight(selected); });
+  addEventListener('keydown', event => {
+    if (event.key === 'Escape' && enabled) { event.preventDefault(); enabled = false; hovered = null; redraw(); send({ type: 'escape' }); }
+  }, true);
+  addEventListener('scroll', redraw, true);
+  addEventListener('resize', redraw);
+  addEventListener('load', redraw, true);
+  addEventListener('DOMContentLoaded', () => { new ResizeObserver(redraw).observe(document.body); redraw(); });
 })();
