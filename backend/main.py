@@ -3,13 +3,14 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 from artifacts import artifact_for_path, object_path, relocate, remove, resolve
 from collaboration_api import router as collaboration_router
 from database import engine
 from dotenv import load_dotenv
 from fastapi import Cookie, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from settings import COOKIE_SECURE, MAX_FILE_BYTES
 from sqlalchemy import text
 from stores import SessionStore
@@ -423,11 +424,27 @@ async def delete_item(
     return {"ok": True}
 
 
+def path_review_url(file_path: str) -> str:
+    # Keep the destination in the SPA URL throughout authentication. Encode the
+    # filename separately because it can contain query/fragment delimiters.
+    resolve_path("/" + file_path)
+    directory, _, name = file_path.rpartition("/")
+    return "/browse" + ("/" + quote(directory, safe="/") if directory else "") + "?f=" + quote(name, safe="")
+
+
 @app.get("/v/{file_path:path}")
-def serve_public(file_path: str, artifact_session: str | None = Cookie(None)):
+def shared_review(file_path: str, artifact_session: str | None = Cookie(None)):
+    destination = path_review_url(file_path)
+    if is_authenticated(artifact_session):
+        artifact = artifact_for_path("/" + file_path)
+        destination = "/a/" + artifact.id
+    return RedirectResponse(destination, status_code=302, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/raw/{file_path:path}")
+def serve_original(file_path: str, artifact_session: str | None = Cookie(None)):
     if AUTH_MODE == "google" and not is_authenticated(artifact_session):
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse(url="/")
+        return RedirectResponse(path_review_url(file_path), status_code=302, headers={"Cache-Control": "no-store"})
     artifact = artifact_for_path("/" + file_path)
     return FileResponse(object_path(artifact.current_revision_id), media_type="text/html",
                         headers={"Content-Security-Policy": "sandbox allow-scripts", "Cache-Control": "no-store"})

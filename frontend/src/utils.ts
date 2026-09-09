@@ -1,4 +1,5 @@
-// Build the public "/v/..." link for a file.
+// Build the shared review "/v/..." link for a file. The server resolves it to
+// the commenting interface and preserves the destination through sign-in.
 //
 // Each path segment is percent-encoded (spaces become %20, etc.) while the
 // "/" separators are preserved. This keeps shared links intact when they're

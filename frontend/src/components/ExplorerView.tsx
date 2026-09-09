@@ -101,7 +101,7 @@ export function ExplorerView({ currentPath, folders, files, tree, onNavigate, on
   const handleContextMenu = (e: React.MouseEvent, item: { name: string; type: string }) => {
     e.preventDefault();
     const items: ContextMenuItem[] = [
-      { label: 'Copy link', icon: <LinkIcon width={14} height={14} />, action: () => onAction('copy-link', item) },
+      { label: 'Copy review link', icon: <LinkIcon width={14} height={14} />, action: () => onAction('copy-link', item) },
       ...(item.type === 'file' ? [{ label: 'Open in new tab', icon: <ExternalLinkIcon width={14} height={14} />, action: () => onAction('open-tab', item) }] : []),
       { divider: true },
       { label: 'Rename', icon: <EditIcon width={14} height={14} />, action: () => startRename(item) },

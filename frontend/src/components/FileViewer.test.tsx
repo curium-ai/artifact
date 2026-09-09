@@ -37,6 +37,15 @@ async function select() {
 beforeEach(() => { vi.clearAllMocks(); history.replaceState({}, '', '/'); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 describe('commenting interactions', () => {
+  it('copies a stable review URL that includes the commenting interface', async () => {
+    const user = userEvent.setup();
+    const write = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    await setup();
+    await user.click(screen.getByRole('button', { name: 'Copy review link' }));
+    expect(write).toHaveBeenCalledWith(`${location.origin}/a/artifact`);
+    await screen.findByText('Review link copied');
+  });
+
   it('focuses selection, posts with keyboard, and remains ready for the next comment', async () => {
     await setup(); await select();
     const editor = screen.getByRole('textbox', { name: 'New comment' });
