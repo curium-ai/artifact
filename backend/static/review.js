@@ -2,10 +2,13 @@
   if (window.parent === window) return;
   const parentOrigin = new URL(document.referrer || location.href).origin;
   let enabled = false, locked = false, selected = null, hovered = null, located = null;
-  let host, root, outline, timer, scheduled = false, markers = [], activeThread = null;
+  let host, root, outline, timer, scheduled = false, markers = [], activeThread = null, navigating = false, focusRequest = 0;
   const send = data => parent.postMessage({ channel: 'artifact-review', ...data }, parentOrigin);
   const quote = value => CSS.escape(value);
-  const text = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+  const normalize = value => (value || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+  const text = el => normalize(el.textContent);
+  const legacyText = el => normalize(el.innerText || el.textContent);
+  const hidden = el => !el.getClientRects().length || getComputedStyle(el).visibility !== 'visible';
   const usable = el => el instanceof HTMLElement && !['HTML', 'BODY', 'SCRIPT', 'STYLE', 'LINK', 'META'].includes(el.tagName) && el !== host && !host?.contains(el);
   function selector(el) {
     if (el.id && document.querySelectorAll('#' + quote(el.id)).length === 1) return '#' + quote(el.id);
@@ -17,7 +20,10 @@
     return 'body > ' + parts.join(' > ');
   }
   function anchor(el) {
-    return { selector: selector(el), text: text(el), tag: el.tagName.toLowerCase(), elementId: el.id || '', stableId: el.getAttribute('data-artifact-id') || '' };
+    const elementId = el.id && document.querySelectorAll('#' + quote(el.id)).length === 1 ? el.id : '';
+    const stable = el.getAttribute('data-artifact-id');
+    const stableId = stable && document.querySelectorAll('[data-artifact-id="' + quote(stable) + '"]').length === 1 ? stable : '';
+    return { selector: selector(el), text: text(el), tag: el.tagName.toLowerCase(), elementId, stableId };
   }
   function mount() {
     if (host) return;
@@ -39,7 +45,7 @@
     outline = document.createElement('div'); outline.className = 'outline'; outline.hidden = true; outline.setAttribute('aria-hidden', 'true');
     root.append(style, outline);
   }
-  function find(a, sameRevision) {
+  function find(a, sameRevision, deferHidden = false) {
     if (!a || typeof a.selector !== 'string' || a.selector.length > 4096) return null;
     if (!sameRevision && !a.stableId && !a.elementId) return null;
     try {
@@ -47,8 +53,79 @@
       const matches = document.querySelectorAll(query);
       if (matches.length !== 1) return null;
       const el = matches[0];
-      return usable(el) && el.tagName.toLowerCase() === a.tag && text(el) === a.text ? el : null;
+      return usable(el) && el.tagName.toLowerCase() === a.tag && (text(el) === a.text || legacyText(el) === a.text || (deferHidden && sameRevision && hidden(el))) ? el : null;
     } catch { return null; }
+  }
+  // Resolve only local, declaratively associated controls. Never evaluate author
+  // scripts, replay arbitrary clicks, or force display styles (which breaks tab state).
+  const controlSelector = 'button, [role="tab"], a[href^="#"]';
+  function controls(panel, buttons = Array.from(document.querySelectorAll(controlSelector))) {
+    const candidates = buttons.filter(button => {
+      if (button.disabled || button.getAttribute('aria-disabled') === 'true' || button.closest('form')) return false;
+      if (button.tagName === 'A' && !button.getAttribute('href')?.startsWith('#')) return false;
+      if (panel.id) {
+        if ((button.getAttribute('aria-controls') || '').split(/\s+/).includes(panel.id)) return true;
+        if (panel.getAttribute('role') === 'tabpanel' && button.id && (panel.getAttribute('aria-labelledby') || '').split(/\s+/).includes(button.id)) return true;
+        if (['data-artifact-target', 'data-target', 'data-bs-target', 'href'].some(attr => button.getAttribute(attr) === '#' + panel.id)) return true;
+        if (button.dataset.tab === panel.id) return true;
+        // Common generated reports: data-select="1" switches a panel id="case-1".
+        const choice = button.dataset.select;
+        if (choice && panel.id.endsWith('-' + choice) && panel.parentElement &&
+            Array.from(panel.parentElement.children).filter(sibling => sibling.id.startsWith(panel.id.slice(0, -choice.length))).length > 1) return true;
+      }
+      if (panel.hasAttribute('data-view') && button.dataset.mode === panel.dataset.view) {
+        // Scope repeated view names to their nearest shared group.
+        let group = panel.parentElement;
+        while (group && group !== document.body && !group.contains(button)) group = group.parentElement;
+        return group && group !== document.body && group.querySelectorAll('[data-view="' + quote(panel.dataset.view) + '"]').length === 1;
+      }
+      return false;
+    });
+    return candidates.length === 1 ? candidates : [];
+  }
+  function navigationControl(target) {
+    const button = target.closest(controlSelector);
+    if (!button) return false;
+    const buttons = Array.from(document.querySelectorAll(controlSelector));
+    return Array.from(document.querySelectorAll('[id], [data-view]')).some(panel => controls(panel, buttons)[0] === button);
+  }
+  async function focus(data) {
+    const request = ++focusRequest;
+    clearTimeout(timer); located = null; redraw();
+    let el = find(data.anchor, data.sameRevision === true, true);
+    if (el && hidden(el)) {
+      const ancestors = [];
+      for (let node = el; node && node !== document.body; node = node.parentElement) ancestors.unshift(node);
+      for (const panel of ancestors) {
+        if (request !== focusRequest) return;
+        if (panel.tagName === 'DETAILS' && !panel.open) panel.open = true;
+        const button = controls(panel)[0];
+        if (button && hidden(panel) && !hidden(button)) {
+          navigating = true;
+          try { button.click(); } finally { navigating = false; }
+          // Give author handlers and layout a bounded opportunity to reveal content.
+          for (let attempt = 0; hidden(panel) && attempt < 20; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+            if (request !== focusRequest) return;
+          }
+        }
+      }
+    }
+    if (request !== focusRequest) return;
+    // A hidden old anchor is provisional: verify its rendered text once revealed.
+    const candidate = el;
+    el = find(data.anchor, data.sameRevision === true);
+    const unavailable = candidate && hidden(candidate);
+    send({ type: 'located', threadId: data.threadId, found: !!el && !hidden(el), reason: unavailable ? 'hidden' : 'missing' });
+    if (el && !hidden(el)) {
+      el.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); showLocation(el);
+    }
+    refreshMarkers();
+  }
+  function refreshMarkers() {
+    for (const marker of markers) marker.el = find(marker.anchor, marker.sameRevision === true, true);
+    send({ type: 'checked', missing: markers.filter(marker => !marker.el).map(marker => marker.id) });
+    redraw();
   }
   function bounds(el) {
     if (!el?.isConnected || !el.getClientRects().length || getComputedStyle(el).visibility !== 'visible') return null;
@@ -98,18 +175,14 @@
     if (data.type === 'parent' && !locked && selected && usable(selected.parentElement)) {
       selected = selected.parentElement; redraw(); send({ type: 'selected', anchor: anchor(selected) });
     }
-    if (data.type === 'focus') {
-      const el = find(data.anchor, data.sameRevision === true);
-      send({ type: 'located', threadId: data.threadId, found: !!el });
-      if (el) { el.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); showLocation(el); }
-    }
+    if (data.type === 'focus') void focus(data);
     if (data.type === 'check' && Array.isArray(data.threads)) {
       mount(); activeThread = data.activeThread;
       const previous = new Map(markers.map(m => [m.id, m]));
       markers = data.threads.map(t => {
         const marker = previous.get(t.id) || { button: document.createElement('button') };
         previous.delete(t.id);
-        Object.assign(marker, t, { el: find(t.anchor, t.sameRevision === true) });
+        Object.assign(marker, t, { el: find(t.anchor, t.sameRevision === true, true) });
         marker.button.type = 'button'; marker.button.textContent = String(t.number);
         marker.button.setAttribute('aria-label', 'Open comment ' + t.number + (t.resolved ? ' (resolved)' : ''));
         marker.button.title = 'Comment ' + t.number;
@@ -124,7 +197,8 @@
   addEventListener('pointermove', event => { if (enabled && !locked && !selected) { hovered = usable(event.target) ? event.target : null; redraw(); } }, true);
   addEventListener('pointerout', event => { if (!event.relatedTarget) { hovered = null; redraw(); } }, true);
   addEventListener('click', event => {
-    if (!enabled || !usable(event.target)) return;
+    if (!enabled || navigating || !usable(event.target)) return;
+    if (!locked && navigationControl(event.target)) return;
     event.preventDefault(); event.stopImmediatePropagation();
     if (locked) return;
     selected = event.target; located = null; redraw(); send({ type: 'selected', anchor: anchor(selected) });
@@ -135,5 +209,7 @@
   addEventListener('scroll', redraw, true);
   addEventListener('resize', redraw);
   addEventListener('load', redraw, true);
-  addEventListener('DOMContentLoaded', () => { new ResizeObserver(redraw).observe(document.body); redraw(); });
+  addEventListener('DOMContentLoaded', () => { new ResizeObserver(redraw).observe(document.body);
+    new MutationObserver(refreshMarkers).observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['hidden', 'class', 'style', 'open', 'aria-selected'] });
+    redraw(); });
 })();

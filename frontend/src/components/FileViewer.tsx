@@ -95,7 +95,7 @@ export function FileViewer({ fileName, path, artifactId, onBack }: FileViewerPro
       if (data.type === 'checked' && Array.isArray(data.missing)) {
         setMissing(data.missing.filter((id: unknown) => typeof id === 'string' && threads.some(t => t.id === id)));
       }
-      if (data.type === 'located' && data.found === false) toast('This section needs reattachment', 'error');
+      if (data.type === 'located' && data.found === false) toast(data.reason === 'hidden' ? 'This section is hidden. Open its tab or expand it, then try again.' : 'This section needs reattachment', 'error');
     };
     window.addEventListener('message', receive);
     return () => window.removeEventListener('message', receive);
