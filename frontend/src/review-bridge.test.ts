@@ -14,7 +14,7 @@ function setup() {
   w.ResizeObserver = class { observe() {} disconnect() {} } as unknown as typeof ResizeObserver;
   w.requestAnimationFrame = callback => { callback(0); return 1; };
   w.HTMLElement.prototype.scrollIntoView = vi.fn();
-  w.HTMLElement.prototype.getClientRects = () => [{ x: 40, y: 100, left: 40, top: 100, right: 440, bottom: 200, width: 400, height: 100 }] as unknown as DOMRectList;
+  w.HTMLElement.prototype.getClientRects = function() { return this.closest('[hidden]') ? [] as unknown as DOMRectList : [{ x: 40, y: 100, left: 40, top: 100, right: 440, bottom: 200, width: 400, height: 100 }] as unknown as DOMRectList; };
   w.HTMLElement.prototype.getBoundingClientRect = () => ({ x: 40, y: 100, left: 40, top: 100, right: 440, bottom: 200, width: 400, height: 100, toJSON() {} });
   let shadow: ShadowRoot;
   const attach = w.Element.prototype.attachShadow;
@@ -72,4 +72,66 @@ describe('sandbox review bridge', () => {
     expect(buttons[0].style.left).not.toBe(buttons[1].style.left);
     expect(buttons[2].hidden).toBe(true);
   });
+  it('reveals nested generated report tabs for legacy anchors while comment mode stays on', () => {
+    const { w, send, parent } = setup();
+    w.document.body.innerHTML = `<button data-select="0">First</button><button data-select="1">Second</button>
+      <section id="case-0"></section><section id="case-1" hidden><div class="editor">
+      <button data-mode="diff">Diff</button><button data-mode="final">Final</button><div class="editorbody">
+      <div data-view="diff"></div><div data-view="final" hidden><article id="target"><p>Heading</p><p>Body</p></article></div></div></div></section>`;
+    const target = w.document.getElementById('target')!;
+    // innerText introduces block separators only when rendered; old anchors used it.
+    Object.defineProperty(target, 'innerText', { get: () => target.closest('[hidden]') ? 'HeadingBody' : 'Heading Body' });
+    w.document.querySelector<HTMLButtonElement>('[data-select="1"]')!.onclick = () => { w.document.getElementById('case-1')!.hidden = false; };
+    w.document.querySelector<HTMLButtonElement>('[data-mode="final"]')!.onclick = () => { w.document.querySelector<HTMLElement>('[data-view="final"]')!.hidden = false; };
+    const anchor = { selector: '#target', elementId: 'target', stableId: '', tag: 'article', text: 'Heading Body' };
+    send({ type: 'mode', enabled: true });
+    send({ type: 'check', threads: [{ id: 'nested', anchor, sameRevision: true, number: 1, visible: true }] });
+    expect(parent.postMessage.mock.calls.slice(-1)[0]?.[0].missing).toEqual([]);
+    send({ type: 'focus', threadId: 'nested', anchor, sameRevision: true });
+    expect(target.closest('[hidden]')).toBeNull();
+    expect(parent.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'located', found: true }), 'https://artifact.test');
+    target.click(); expect(parent.postMessage.mock.calls.slice(-1)[0]?.[0].type).toBe('selected');
+  });
+  it('uses ARIA tab controls and permits tab navigation in comment mode', () => {
+    const { w, send, parent } = setup();
+    w.document.body.innerHTML = '<button role="tab" aria-controls="panel"><span>Tab</span></button><section id="panel" role="tabpanel" hidden><p id="target">Text</p></section>';
+    const button = w.document.querySelector('button')!;
+    button.onclick = () => { w.document.getElementById('panel')!.hidden = false; };
+    send({ type: 'mode', enabled: true }); w.document.querySelector('span')!.click();
+    expect(w.document.getElementById('panel')!.hidden).toBe(false);
+    expect(parent.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'selected' }), expect.anything());
+    w.document.getElementById('panel')!.hidden = true;
+    send({ type: 'focus', anchor: { selector: '#target', elementId: 'target', tag: 'p', text: 'Text' }, sameRevision: true });
+    expect(w.document.getElementById('panel')!.hidden).toBe(false);
+  });
+  it('does not claim hidden unsupported content needs reattachment or click ambiguous controls', () => {
+    const { w, send, parent, anchor } = setup();
+    w.document.getElementById('overview')!.hidden = true;
+    w.document.body.insertAdjacentHTML('beforeend', '<button aria-controls="overview">One</button><button aria-controls="overview">Two</button>');
+    const click = vi.fn(); w.document.querySelectorAll('button').forEach(button => button.onclick = click);
+    send({ type: 'focus', anchor, sameRevision: true });
+    expect(click).not.toHaveBeenCalled();
+    expect(parent.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'located', found: false, reason: 'hidden' }), 'https://artifact.test');
+  });
+  it('validates changed legacy text after revealing and never highlights the wrong section', () => {
+    const { w, send, parent, anchor, mark, root } = setup();
+    const section = w.document.getElementById('overview')!; section.hidden = true; section.textContent = 'Changed';
+    w.document.body.insertAdjacentHTML('beforeend', '<button aria-controls="overview">Open</button>');
+    w.document.querySelector<HTMLButtonElement>('[aria-controls]')!.onclick = () => { section.hidden = false; };
+    mark(); send({ type: 'focus', anchor, sameRevision: true });
+    expect(parent.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'located', found: false, reason: 'missing' }), 'https://artifact.test');
+    expect((root().querySelector('.outline') as HTMLElement).hidden).toBe(true);
+    expect(parent.postMessage.mock.calls.slice(-1)[0]?.[0].missing).toEqual(['one']);
+  });
+
+  it('anchors duplicate IDs in tab views with a unique DOM path', () => {
+    const { w, send, parent } = setup();
+    w.document.body.innerHTML = '<section><p id="repeated" data-artifact-id="repeated">Text</p></section><section hidden><p id="repeated" data-artifact-id="repeated">Text</p></section>';
+    send({ type: 'mode', enabled: true }); w.document.querySelector('p')!.click();
+    const anchor = parent.postMessage.mock.calls.slice(-1)[0]?.[0].anchor;
+    expect(anchor.elementId).toBe(''); expect(anchor.stableId).toBe('');
+    send({ type: 'focus', anchor, sameRevision: true });
+    expect(parent.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'located', found: true }), 'https://artifact.test');
+  });
+
 });
