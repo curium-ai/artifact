@@ -39,7 +39,7 @@ For Google login, register your public origin as an authorized JavaScript origin
 `<public-origin>/mcp/google/callback` as an authorized redirect URI in Google Cloud.
 Configure the client ID, secret, domain, and `ARTIFACT_AUTH_MODE=google` on the server.
 In Google mode both raw file links and review links require sign-in. Password mode keeps
-legacy raw `/v/` links public while review/comment APIs require login.
+explicit `/raw/` links public while review/comment APIs require login.
 
 ## Validation
 
@@ -105,8 +105,11 @@ client-approval page; routine token refresh does not require another Google logi
 
 ### Reviews
 
-Use `/a/<artifact-id>` for stable review links; existing `/v/<path>` links still render the
-original file. In the reviewer, enable comment mode, select an element, optionally select
+Use `/a/<artifact-id>` for stable review links. Existing `/v/<path>` shared links now
+open the same commenting interface, preserving the requested document through sign-in.
+Copying the browser URL, the file menu’s Copy review link, or the viewer’s Copy review
+link all leads to review. Commenting requires authentication; anonymous comments are
+not enabled. Use `/raw/<path>` explicitly for the original sandboxed HTML. In the reviewer, enable comment mode, select an element, optionally select
 its containing element, and post a thread. Reply, resolve, reopen, or explicitly reattach
 an outdated anchor. Only the thread author or artifact owner can resolve or reattach it.
 

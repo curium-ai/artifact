@@ -45,7 +45,7 @@ def test_large_upload_and_idempotent_retry(client, upload_dir):
     content = b"<html>" + b"x" * (11 * 1024 * 1024) + b"</html>"
     result, grant = upload(client, author, content)
     assert client.put(grant["uploadUrl"], content=content).json() == result
-    assert client.get("/v/report.html").content == content
+    assert client.get("/raw/report.html").content == content
     assert object_path(result["revisionId"]).read_bytes() == content
     with transaction() as db:
         assert len(db.scalars(select(Revision)).all()) == 1
@@ -187,8 +187,8 @@ def test_move_preserves_threads_and_review_identity(client):
     )
     assert client.get(f"/api/artifacts/{result['artifactId']}").json()["path"] == "/renamed.html"
     assert client.get(f"/api/artifacts/{result['artifactId']}/threads").json()[0]["id"] == tid
-    assert client.get("/v/report.html").status_code == 404
-    assert client.get("/v/renamed.html").status_code == 200
+    assert client.get("/raw/report.html").status_code == 404
+    assert client.get("/raw/renamed.html").status_code == 200
 
 
 def test_review_keeps_source_and_sandbox(client):
@@ -197,7 +197,7 @@ def test_review_keeps_source_and_sandbox(client):
     assert response.status_code == 200
     assert response.headers["content-security-policy"] == "sandbox allow-scripts"
     assert "artifact-review" in response.text
-    assert "artifact-review" not in client.get("/v/report.html").text
+    assert "artifact-review" not in client.get("/raw/report.html").text
 
 
 def test_browser_rejects_oversize_during_parsing(client, monkeypatch, upload_dir):
@@ -268,3 +268,43 @@ def test_interrupted_upload_discards_staging(client, upload_dir):
     assert not (upload_dir / "interrupted.html").exists()
     assert not list((upload_dir / ".staging").iterdir())
     assert client.put(grant["uploadUrl"], content=b"abcdef").status_code == 200
+
+
+def test_shared_link_opens_review_and_preserves_encoded_path_through_login(client, monkeypatch):
+    from urllib.parse import quote
+
+    import main
+
+    author = user(client)
+    path = '/folder with spaces/report #1 & notes.html'
+    result, _ = upload(client, author, path=path)
+    shared = '/v' + quote(path, safe='/')
+    response = client.get(shared, follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers['location'] == '/a/' + result['artifactId']
+    assert response.headers['cache-control'] == 'no-store'
+    assert client.get(response.headers['location'], follow_redirects=False).headers['location'] == '/browse?artifact=' + result['artifactId']
+
+    client.cookies.clear()
+    monkeypatch.setattr(main, 'AUTH_MODE', 'google')
+    response = client.get(shared, follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers['location'] == '/browse/folder%20with%20spaces?f=report%20%231%20%26%20notes.html'
+    assert client.get('/api/artifact', params={'path': path}).status_code == 401
+    user(client)
+    assert client.get('/api/artifact', params={'path': path}).json()['id'] == result['artifactId']
+
+
+def test_signed_out_shared_link_does_not_disclose_existence(client, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, 'AUTH_MODE', 'google')
+    response = client.get('/v/not-created.html', follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers['location'] == '/browse?f=not-created.html'
+    response = client.get('/raw/not-created.html', follow_redirects=False)
+    assert response.headers['location'] == '/browse?f=not-created.html'
+
+
+def test_shared_link_rejects_traversal(client):
+    assert client.get('/v/%2E%2E/secret.html', follow_redirects=False).status_code == 400

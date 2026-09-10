@@ -8,6 +8,7 @@ export default defineConfig({
       '/api': 'http://localhost:8000',
       '/a/': 'http://localhost:8000',
       '/v': 'http://localhost:8000',
+      '/raw/': 'http://localhost:8000',
     },
   },
 })

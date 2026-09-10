@@ -78,21 +78,21 @@ class TestPathTraversal:
 class TestPublicView:
     def test_serves_html_with_csp_sandbox(self, client, upload_dir):
         make_file(upload_dir, "doc.html", "<h1>doc</h1>")
-        res = client.get("/v/doc.html")
+        res = client.get("/raw/doc.html")
         assert res.status_code == 200
         assert "doc" in res.text
         assert res.headers["content-security-policy"] == "sandbox allow-scripts"
 
     def test_nested_path(self, client, upload_dir):
         make_file(upload_dir, "folder/deep.html", "<h1>deep</h1>")
-        assert client.get("/v/folder/deep.html").status_code == 200
+        assert client.get("/raw/folder/deep.html").status_code == 200
 
     def test_missing_file_404(self, client):
-        assert client.get("/v/nope.html").status_code == 404
+        assert client.get("/raw/nope.html").status_code == 404
 
     def test_non_html_404(self, client, upload_dir):
         (upload_dir / "x.txt").write_text("nope")
-        assert client.get("/v/x.txt").status_code == 404
+        assert client.get("/raw/x.txt").status_code == 404
 
 
 class TestMCPBearerAuth:
